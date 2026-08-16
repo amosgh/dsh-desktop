@@ -1,4 +1,4 @@
-# DSH Desktop
+# DeepseekHarness Desktop
 
 An experimental, local-first macOS desktop client for DeepSeek Harness. This is a community project and is not an official DeepSeek application.
 
@@ -23,6 +23,11 @@ The local MVP implements the complete supervised task loop:
 - Per-task Git worktrees pinned to a base commit, repository mutation serialization, review/diff, commit, external tools, and confirmed discard.
 - Keychain-backed API-key encryption, endpoint/model settings, connection checks, and redacted diagnostics export.
 - Light/dark appearance and reduced-motion support.
+
+  <img width="1180" height="760" alt="image" src="https://github.com/user-attachments/assets/3773a434-5bf9-4715-acda-a9410daf3e9f" />
+
+  <img width="1280" height="820" alt="image" src="https://github.com/user-attachments/assets/27385e8e-4fbc-44d8-ab36-0a5d0d9d3589" />
+
 
 The upstream Web transport still lacks its own authentication layer. Renderer never receives its raw origin or the gateway credential; requests to the desktop gateway without the ephemeral capability receive `401`. The raw upstream loopback port remains reachable to other processes running as the same macOS user until Harness supports a token-aware or non-TCP carrier.
 
