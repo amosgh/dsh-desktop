@@ -21,7 +21,7 @@ The local MVP implements the complete supervised task loop:
 - Paginated history, plan projection, live timeline, reconnect recovery, and a 10,000-event replay fixture.
 - Inbox approvals and questions with exact operation details, single-resolution semantics, and native notifications.
 - Per-task Git worktrees pinned to a base commit, repository mutation serialization, review/diff, commit, external tools, and confirmed discard.
-- In-app Markdown preview for task worktrees and a sandboxed internal browser for HTTP/HTTPS links.
+- Codex-style right-side preview for conversation Markdown reports and a sandboxed internal browser for HTTP/HTTPS links.
 - Keychain-backed API-key encryption, endpoint/model settings, connection checks, and redacted diagnostics export.
 - Light/dark appearance and reduced-motion support.
 
@@ -77,7 +77,7 @@ Keep the terminal open while using the development app. On first launch:
 
 The selected project must be a writable Git worktree with at least one commit and a valid `HEAD`. New tasks create isolated worktrees, so keep at least 256 MB of free disk space. The connection test calls `<base URL>/models` and does not create a billable chat completion; a successful catalog response alone cannot prove full chat, streaming, reasoning, or tool-call compatibility.
 
-Markdown files selected in a task's change review open in a read-only in-app preview. Relative Markdown links stay inside the same managed worktree; HTTP/HTTPS links open in a separate sandboxed browser window. That browser denies permission requests, downloads, embedded credentials, `file:` URLs, and executable URL schemes. Other local file types continue to use Finder or the configured external editor.
+Markdown reports linked from a conversation, including relative links, absolute worktree paths, and `file://` links, open read-only in a Codex-style right-side panel. The main process verifies that every file remains inside that task's managed worktree and accepts only `.md`/`.markdown` files up to 1 MB. HTTP/HTTPS links open in the same panel through a separate sandboxed web contents process. It denies permission requests, downloads, embedded credentials, `file:` navigation, and executable URL schemes. Other local file types continue to use Finder or the configured external editor.
 
 ## Verify the checkout
 

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { access, mkdir, readFile, realpath, rm, statfs } from "node:fs/promises";
-import { extname, join, relative, resolve } from "node:path";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { FilePreview, GitChangedFile, GitReviewSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
 
@@ -87,7 +87,7 @@ export class GitService {
 
   async preview(workspace: TaskWorkspaceRecord, path: string): Promise<FilePreview> {
     return this.#withRepositoryLock(workspace.repositoryPath, async () => {
-      const safePath = this.#validateRelativePath(path);
+      const safePath = this.#validatePreviewPath(workspace, path);
       if (![".md", ".markdown"].includes(extname(safePath).toLowerCase())) throw new Error("当前仅支持在应用内预览 Markdown 文件。");
       let content: string;
       try {
@@ -184,6 +184,15 @@ export class GitService {
   #validateRelativePath(path: string): string {
     if (!path || path.includes("\0") || resolve("/", path).startsWith("/../") || path.startsWith("/") || path.split(/[\\/]/).includes("..")) throw new Error("文件路径无效。");
     return path;
+  }
+
+  #validatePreviewPath(workspace: TaskWorkspaceRecord, path: string): string {
+    if (!isAbsolute(path)) return this.#validateRelativePath(path);
+    if (path.includes("\0")) throw new Error("文件路径无效。");
+    const root = resolve(workspace.worktreePath);
+    const rel = relative(root, resolve(path));
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new Error("Markdown 文件超出任务 worktree 范围。");
+    return this.#validateRelativePath(rel);
   }
 
   #assertGeneratedPath(path: string): void {

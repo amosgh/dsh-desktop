@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { DesktopTaskSummary, FilePreview, GitReviewSnapshot, PendingApproval, PendingQuestion, ProjectRecord, ProtocolSnapshot, SettingsSnapshot, SidecarPhase, SidecarSnapshot, TaskTimelineSnapshot, TimelineItem } from "../shared/contracts";
+import type { BrowserNavigationSnapshot, BrowserViewBounds, DesktopTaskSummary, FilePreview, GitReviewSnapshot, PendingApproval, PendingQuestion, ProjectRecord, ProtocolSnapshot, SettingsSnapshot, SidecarPhase, SidecarSnapshot, TaskTimelineSnapshot, TimelineItem } from "../shared/contracts";
 
 const INITIAL: SidecarSnapshot = {
   phase: "idle",
@@ -153,6 +153,9 @@ interface TasksViewProps {
   onRefresh(): void;
   onChooseProject(): void;
   onOpenHarness(): void;
+  onOpenMarkdown(sessionId: string, path: string): void;
+  onOpenWeb(url: string): void;
+  onPreviewError(message: string): void;
   openSessionId?: string;
   onOpenedSession(): void;
 }
@@ -283,7 +286,7 @@ function InboxView({ protocol, error, onApproval, onQuestion, onOpenTask }: {
   );
 }
 
-function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protocol: ProtocolSnapshot }) {
+function SettingsView({ runtime, protocol, onOpenWeb }: { runtime: SidecarSnapshot; protocol: ProtocolSnapshot; onOpenWeb(url: string): void }) {
   const [settings, setSettings] = useState<SettingsSnapshot>();
   const [apiKey, setApiKey] = useState("");
   const [baseURL, setBaseURL] = useState("https://api.deepseek.com");
@@ -334,13 +337,6 @@ function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protoco
     setBusy(false);
   }
 
-  async function openBrowser() {
-    setBusy(true); setMessage(undefined);
-    const result = await window.dshDesktop.openWebAddress(browserURL);
-    if (!result.ok) setMessage({ kind: "error", text: result.error });
-    setBusy(false);
-  }
-
   return (
     <main className="workspace settings-workspace">
       <header className="workspace-header"><div><p className="context-line">本机配置</p><h1>设置</h1></div><span className={`settings-health settings-health--${settings?.credentialConfigured ? "ready" : "missing"}`}>{settings?.credentialConfigured ? "凭证已配置" : "需要 API Key"}</span></header>
@@ -352,14 +348,14 @@ function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protoco
         <div className="settings-form-actions"><button className="button button--secondary" type="button" onClick={() => void testConnection()} disabled={busy || (!apiKey.trim() && !settings?.credentialConfigured)}>测试连接</button><button className="button button--primary" type="button" onClick={() => void save()} disabled={busy || !baseURL.trim() || !model.trim()}>{busy ? "正在处理…" : "保存并重启 Harness"}</button></div>
       </div></section>
       <section className="settings-section" aria-labelledby="workspace-settings"><header><h2 id="workspace-settings">工作区与外部工具</h2><p>新任务默认使用从当前 HEAD 创建的独立 Git worktree。</p></header><div className="settings-form"><label><span>外部编辑器</span><select value={editor} onChange={(event) => setEditor(event.target.value as "vscode" | "system")}><option value="vscode">Visual Studio Code</option><option value="system">系统默认应用</option></select></label><div className="settings-readonly"><span>任务隔离</span><strong>独立 worktree（默认）</strong></div></div></section>
-      <section className="settings-section" aria-labelledby="browser-settings"><header><h2 id="browser-settings">内置浏览器</h2><p>在独立沙箱窗口打开 HTTP/HTTPS 地址；权限请求、下载和非网页协议默认拒绝。</p></header><div className="settings-form"><label><span>网络地址</span><input type="url" value={browserURL} onChange={(event) => setBrowserURL(event.target.value)} placeholder="https://example.com" spellCheck={false} /><small>Markdown 中的网络链接也会使用这个受限窗口打开。任务 worktree 内的 Markdown 文件则直接在变更审阅中预览。</small></label><div className="settings-form-actions"><button className="button button--secondary" type="button" onClick={() => void openBrowser()} disabled={busy || !browserURL.trim()}>在内置浏览器打开</button></div></div></section>
+      <section className="settings-section" aria-labelledby="browser-settings"><header><h2 id="browser-settings">内置浏览器</h2><p>在应用右侧的隔离浏览器打开 HTTP/HTTPS 地址；权限请求、下载和非网页协议默认拒绝。</p></header><div className="settings-form"><label><span>网络地址</span><input type="url" value={browserURL} onChange={(event) => setBrowserURL(event.target.value)} placeholder="https://example.com" spellCheck={false} /><small>对话和 Markdown 中的网络链接会在右侧打开；任务 worktree 内的 Markdown 报告也会在同一位置预览。</small></label><div className="settings-form-actions"><button className="button button--secondary" type="button" onClick={() => onOpenWeb(browserURL)} disabled={busy || !browserURL.trim()}>在右侧打开</button></div></div></section>
       <section className="settings-section" aria-labelledby="diagnostic-settings"><header><h2 id="diagnostic-settings">运行时与诊断</h2><p>导出的 JSON 会移除密钥、传输凭证、端点和项目绝对路径。</p></header><div className="diagnostic-grid"><div><span>Harness</span><strong>{PHASE_LABEL[runtime.phase]}</strong></div><div><span>协议</span><strong>{PROTOCOL_LABEL[protocol.phase]} · 代次 {protocol.generation}</strong></div><div><span>版本</span><strong>{runtime.harnessVersion}</strong></div></div><button className="button button--secondary" type="button" onClick={() => void exportDiagnostics()} disabled={busy}>导出诊断信息…</button></section>
       <footer className="workspace-footer"><span>遥测默认关闭</span><span>社区项目 · 非 DeepSeek 官方应用</span></footer>
     </main>
   );
 }
 
-function TimelineRow({ item }: { item: TimelineItem }) {
+function TimelineRow({ item, onOpenFile, onOpenWeb, onError }: { item: TimelineItem; onOpenFile(path: string): void; onOpenWeb(url: string): void; onError(message: string): void }) {
   if (item.kind === "tool") {
     return (
       <details className={`timeline-tool timeline-tool--${item.toolState ?? "completed"}`}>
@@ -387,19 +383,25 @@ function TimelineRow({ item }: { item: TimelineItem }) {
         <span>{item.kind === "user" ? "你" : item.kind === "reasoning" ? "思考过程" : "Harness"}</span>
         <time>{new Date(item.time).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time>
       </header>
-      <p>{item.text}</p>
+      <MarkdownPreview preview={{ path: "", kind: "markdown", content: item.text ?? "" }} onOpenFile={onOpenFile} onOpenWeb={onOpenWeb} onError={onError} compact />
     </article>
   );
 }
 
 const FILE_STATUS_LABEL: Record<string, string> = { added: "新增", modified: "修改", deleted: "删除", renamed: "重命名", untracked: "未跟踪", conflicted: "冲突" };
 
-function markdownTarget(currentPath: string, href: string): string | undefined {
-  const clean = href.split(/[?#]/, 1)[0] ?? "";
-  if (!clean || clean.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(clean)) return undefined;
+export function classifyMarkdownHref(currentPath: string, href: string): { kind: "web" | "file"; value: string } | undefined {
+  const trimmed = href.trim();
+  if (/^https?:\/\//i.test(trimmed)) return { kind: "web", value: trimmed };
+  const clean = trimmed.split(/[?#]/, 1)[0] ?? "";
+  if (!clean) return undefined;
   let decoded: string;
-  try { decoded = decodeURIComponent(clean); } catch { return undefined; }
-  const parts = [...currentPath.split("/").slice(0, -1), ...decoded.split("/")];
+  try {
+    decoded = /^file:\/\//i.test(clean) ? decodeURIComponent(new URL(clean).pathname) : decodeURIComponent(clean);
+  } catch { return undefined; }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(decoded) || !/\.md(?:own)?$/i.test(decoded)) return undefined;
+  if (decoded.startsWith("/")) return { kind: "file", value: decoded };
+  const parts = [...(currentPath ? currentPath.split("/").slice(0, -1) : []), ...decoded.split("/")];
   const normalized: string[] = [];
   for (const part of parts) {
     if (!part || part === ".") continue;
@@ -407,10 +409,10 @@ function markdownTarget(currentPath: string, href: string): string | undefined {
     else normalized.push(part);
   }
   const path = normalized.join("/");
-  return /\.md(?:own)?$/i.test(path) ? path : undefined;
+  return path ? { kind: "file", value: path } : undefined;
 }
 
-function MarkdownInline({ text, currentPath, onOpenFile, onError }: { text: string; currentPath: string; onOpenFile(path: string): void; onError(message: string): void }) {
+function MarkdownInline({ text, currentPath, onOpenFile, onOpenWeb, onError }: { text: string; currentPath: string; onOpenFile(path: string): void; onOpenWeb(url: string): void; onError(message: string): void }) {
   const nodes: ReactNode[] = [];
   const pattern = /(`[^`]+`|\[[^\]]+\]\([^)]+\)|https?:\/\/[^\s<]+)/g;
   let cursor = 0;
@@ -424,12 +426,9 @@ function MarkdownInline({ text, currentPath, onOpenFile, onError }: { text: stri
       const label = link?.[1] ?? token;
       const href = link?.[2] ?? token;
       nodes.push(<button className="markdown-link" type="button" key={index} onClick={() => {
-        if (/^https?:\/\//i.test(href)) {
-          void window.dshDesktop.openWebAddress(href).then((result) => { if (!result.ok) onError(result.error); });
-          return;
-        }
-        const path = markdownTarget(currentPath, href);
-        if (path) onOpenFile(path);
+        const target = classifyMarkdownHref(currentPath, href);
+        if (target?.kind === "web") onOpenWeb(target.value);
+        else if (target?.kind === "file") onOpenFile(target.value);
         else onError("该链接不是可预览的 Markdown 文件或 HTTP/HTTPS 地址。");
       }}>{label}</button>);
     }
@@ -439,7 +438,7 @@ function MarkdownInline({ text, currentPath, onOpenFile, onError }: { text: stri
   return <>{nodes}</>;
 }
 
-export function MarkdownPreview({ preview, onOpenFile, onError }: { preview: FilePreview; onOpenFile(path: string): void; onError(message: string): void }) {
+export function MarkdownPreview({ preview, onOpenFile, onOpenWeb = () => undefined, onError, compact = false }: { preview: FilePreview; onOpenFile(path: string): void; onOpenWeb?(url: string): void; onError(message: string): void; compact?: boolean }) {
   const lines = preview.content.replaceAll("\r\n", "\n").split("\n");
   const blocks: ReactNode[] = [];
   for (let index = 0; index < lines.length;) {
@@ -457,7 +456,7 @@ export function MarkdownPreview({ preview, onOpenFile, onError }: { preview: Fil
     const heading = /^(#{1,6})\s+(.+)$/.exec(line);
     if (heading) {
       const level = Math.min(6, heading[1]?.length ?? 1);
-      const content = <MarkdownInline text={heading[2] ?? ""} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} />;
+      const content = <MarkdownInline text={heading[2] ?? ""} currentPath={preview.path} onOpenFile={onOpenFile} onOpenWeb={onOpenWeb} onError={onError} />;
       blocks.push(level === 1 ? <h1 key={index}>{content}</h1> : level === 2 ? <h2 key={index}>{content}</h2> : level === 3 ? <h3 key={index}>{content}</h3> : <h4 key={index}>{content}</h4>);
       index += 1;
       continue;
@@ -465,31 +464,97 @@ export function MarkdownPreview({ preview, onOpenFile, onError }: { preview: Fil
     if (/^\s*[-*+]\s+/.test(line)) {
       const items: string[] = [];
       while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index] ?? "")) items.push((lines[index++] ?? "").replace(/^\s*[-*+]\s+/, ""));
-      blocks.push(<ul key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></li>)}</ul>);
+      blocks.push(<ul key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} currentPath={preview.path} onOpenFile={onOpenFile} onOpenWeb={onOpenWeb} onError={onError} /></li>)}</ul>);
       continue;
     }
     if (/^\s*\d+[.)]\s+/.test(line)) {
       const items: string[] = [];
       while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index] ?? "")) items.push((lines[index++] ?? "").replace(/^\s*\d+[.)]\s+/, ""));
-      blocks.push(<ol key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></li>)}</ol>);
+      blocks.push(<ol key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} currentPath={preview.path} onOpenFile={onOpenFile} onOpenWeb={onOpenWeb} onError={onError} /></li>)}</ol>);
       continue;
     }
     if (/^>\s?/.test(line)) {
       const quote: string[] = [];
       while (index < lines.length && /^>\s?/.test(lines[index] ?? "")) quote.push((lines[index++] ?? "").replace(/^>\s?/, ""));
-      blocks.push(<blockquote key={`quote-${index}`}><MarkdownInline text={quote.join(" ")} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></blockquote>);
+      blocks.push(<blockquote key={`quote-${index}`}><MarkdownInline text={quote.join(" ")} currentPath={preview.path} onOpenFile={onOpenFile} onOpenWeb={onOpenWeb} onError={onError} /></blockquote>);
       continue;
     }
     if (/^\s*(?:---+|\*\*\*+)\s*$/.test(line)) { blocks.push(<hr key={index} />); index += 1; continue; }
     const paragraph = [line.trim()];
     index += 1;
     while (index < lines.length && (lines[index] ?? "").trim() && !/^(?:#{1,6}\s|```|\s*[-*+]\s+|\s*\d+[.)]\s+|>\s?)/.test(lines[index] ?? "")) paragraph.push((lines[index++] ?? "").trim());
-    blocks.push(<p key={`p-${index}`}><MarkdownInline text={paragraph.join(" ")} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></p>);
+    blocks.push(<p key={`p-${index}`}><MarkdownInline text={paragraph.join(" ")} currentPath={preview.path} onOpenFile={onOpenFile} onOpenWeb={onOpenWeb} onError={onError} /></p>);
   }
-  return <article className="markdown-preview">{blocks}</article>;
+  return <div className={`markdown-preview${compact ? " markdown-preview--compact" : ""}`}>{blocks}</div>;
 }
 
-function ReviewPanel({ sessionId, onDiscarded }: { sessionId: string; onDiscarded(): void }) {
+type RightPreview =
+  | { kind: "loading"; title: string; sessionId: string }
+  | { kind: "markdown"; sessionId: string; preview: FilePreview }
+  | { kind: "web"; url: string }
+  | { kind: "error"; title: string; message: string };
+
+function elementBounds(element: HTMLElement): BrowserViewBounds | undefined {
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return undefined;
+  return { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
+}
+
+function RightPreviewPanel({ value, onClose, onOpenMarkdown, onOpenWeb }: {
+  value: RightPreview;
+  onClose(): void;
+  onOpenMarkdown(sessionId: string, path: string): void;
+  onOpenWeb(url: string): void;
+}) {
+  const browserHost = useRef<HTMLDivElement>(null);
+  const [navigation, setNavigation] = useState<BrowserNavigationSnapshot>();
+  const [browserError, setBrowserError] = useState<string>();
+
+  useEffect(() => window.dshDesktop.subscribeBrowserNavigation(setNavigation), []);
+  useEffect(() => {
+    if (value.kind !== "web" || !browserHost.current) return;
+    setBrowserError(undefined);
+    setNavigation(undefined);
+    const host = browserHost.current;
+    let opened = false;
+    const syncBounds = () => {
+      const bounds = elementBounds(host);
+      if (!bounds) return;
+      if (!opened) {
+        opened = true;
+        void window.dshDesktop.openWebAddress(value.url, bounds).then((result) => { if (!result.ok) setBrowserError(result.error); });
+      } else {
+        void window.dshDesktop.setBrowserViewBounds(bounds).then((result) => { if (!result.ok) setBrowserError(result.error); });
+      }
+    };
+    const observer = new ResizeObserver(syncBounds);
+    observer.observe(host);
+    syncBounds();
+    return () => { observer.disconnect(); void window.dshDesktop.closeBrowserView(); };
+  }, [value]);
+
+  const title = value.kind === "markdown" ? value.preview.path : value.kind === "web" ? navigation?.title || "内置浏览器" : value.title;
+  return (
+    <aside className="right-preview" aria-label="右侧预览">
+      <header className="right-preview-header">
+        {value.kind === "web" && <nav aria-label="浏览器导航"><button type="button" aria-label="后退" disabled={!navigation?.canGoBack} onClick={() => void window.dshDesktop.navigateBrowserView("back")}>‹</button><button type="button" aria-label="前进" disabled={!navigation?.canGoForward} onClick={() => void window.dshDesktop.navigateBrowserView("forward")}>›</button><button type="button" aria-label="重新载入" onClick={() => void window.dshDesktop.navigateBrowserView("reload")}>↻</button></nav>}
+        <div><strong title={title}>{title}</strong>{value.kind === "web" && <span title={navigation?.url || value.url}>{navigation?.url || value.url}</span>}</div>
+        <button className="right-preview-close" type="button" aria-label="关闭预览" onClick={onClose}>×</button>
+      </header>
+      {value.kind === "markdown" ? (
+        <MarkdownPreview preview={value.preview} onOpenFile={(path) => onOpenMarkdown(value.sessionId, path)} onOpenWeb={onOpenWeb} onError={(message) => setBrowserError(message)} />
+      ) : value.kind === "web" ? (
+        <div className="browser-preview-body"><div className="browser-view-host" ref={browserHost} />{(browserError || navigation?.loading) && <div className={`browser-preview-status${browserError ? " browser-preview-status--error" : ""}`} role="status">{browserError || "正在载入…"}</div>}</div>
+      ) : value.kind === "loading" ? (
+        <div className="right-preview-state"><span className="preview-spinner" aria-hidden="true" /><p>正在载入 Markdown…</p></div>
+      ) : (
+        <div className="right-preview-state right-preview-state--error"><strong>无法打开预览</strong><p>{value.message}</p></div>
+      )}
+    </aside>
+  );
+}
+
+function ReviewPanel({ sessionId, onDiscarded, onOpenWeb }: { sessionId: string; onDiscarded(): void; onOpenWeb(url: string): void }) {
   const [review, setReview] = useState<GitReviewSnapshot>();
   const [selectedPath, setSelectedPath] = useState<string>();
   const [diff, setDiff] = useState("");
@@ -585,7 +650,7 @@ function ReviewPanel({ sessionId, onDiscarded }: { sessionId: string; onDiscarde
             ))}
           </aside>
           <div className="diff-viewer">
-            {selectedPath ? <><header><span>{selectedPath}</span>{/\.md(?:own)?$/i.test(selectedPath) && <nav aria-label="Markdown 查看方式"><button className={viewerMode === "preview" ? "active" : ""} type="button" onClick={() => void showPreview()}>预览</button><button className={viewerMode === "diff" ? "active" : ""} type="button" onClick={() => void showDiff()}>差异</button></nav>}</header>{viewerMode === "preview" ? preview ? <MarkdownPreview preview={preview} onOpenFile={(path) => void showPreview(path)} onError={setError} /> : <div><p>正在载入 Markdown…</p></div> : <pre>{diff}</pre>}</> : <div><h2>选择文件查看差异</h2><p>Markdown 文件会优先在应用内预览。</p></div>}
+            {selectedPath ? <><header><span>{selectedPath}</span>{/\.md(?:own)?$/i.test(selectedPath) && <nav aria-label="Markdown 查看方式"><button className={viewerMode === "preview" ? "active" : ""} type="button" onClick={() => void showPreview()}>预览</button><button className={viewerMode === "diff" ? "active" : ""} type="button" onClick={() => void showDiff()}>差异</button></nav>}</header>{viewerMode === "preview" ? preview ? <MarkdownPreview preview={preview} onOpenFile={(path) => void showPreview(path)} onOpenWeb={onOpenWeb} onError={setError} /> : <div><p>正在载入 Markdown…</p></div> : <pre>{diff}</pre>}</> : <div><h2>选择文件查看差异</h2><p>Markdown 文件会优先在应用内预览。</p></div>}
           </div>
         </div>
       )}
@@ -597,7 +662,7 @@ function ReviewPanel({ sessionId, onDiscarded }: { sessionId: string; onDiscarde
   );
 }
 
-function TaskDetail({ task, timeline, onBack, onLoadOlder, onReload, onCancel, onOpenHarness, onSend, onRename, onFork, onArchive }: {
+function TaskDetail({ task, timeline, onBack, onLoadOlder, onReload, onCancel, onOpenHarness, onOpenMarkdown, onOpenWeb, onPreviewError, onSend, onRename, onFork, onArchive }: {
   task: DesktopTaskSummary;
   timeline?: TaskTimelineSnapshot;
   onBack(): void;
@@ -605,6 +670,9 @@ function TaskDetail({ task, timeline, onBack, onLoadOlder, onReload, onCancel, o
   onReload?(): void;
   onCancel(): void;
   onOpenHarness(): void;
+  onOpenMarkdown(path: string): void;
+  onOpenWeb(url: string): void;
+  onPreviewError(message: string): void;
   onSend(prompt: string, mode: "queue" | "steer"): Promise<boolean>;
   onRename(title: string): Promise<boolean>;
   onFork(atSeq?: number): Promise<void>;
@@ -650,7 +718,7 @@ function TaskDetail({ task, timeline, onBack, onLoadOlder, onReload, onCancel, o
         <button role="tab" aria-selected={detailTab === "review"} className={detailTab === "review" ? "task-tab--active" : ""} type="button" onClick={() => setDetailTab("review")}>变更审阅</button>
       </div>
 
-      {detailTab === "review" ? <ReviewPanel sessionId={task.sessionId} onDiscarded={onBack} /> : <><section className="timeline" aria-label="任务对话时间线" aria-busy={timeline?.phase === "loading"}>
+      {detailTab === "review" ? <ReviewPanel sessionId={task.sessionId} onDiscarded={onBack} onOpenWeb={onOpenWeb} /> : <><section className="timeline" aria-label="任务对话时间线" aria-busy={timeline?.phase === "loading"}>
         {timeline?.hasMore && (
           <button className="load-older" type="button" onClick={onLoadOlder} disabled={timeline.phase === "loading"}>
             {timeline.phase === "loading" ? "正在载入…" : "载入更早记录"}
@@ -667,7 +735,7 @@ function TaskDetail({ task, timeline, onBack, onLoadOlder, onReload, onCancel, o
         ) : timeline?.phase === "error" && timeline.items.length === 0 ? (
           <div className="timeline-empty"><h2>任务记录暂时无法载入</h2><p>{timeline.error}</p><button className="button button--secondary" type="button" onClick={onReload ?? onLoadOlder}>重试</button></div>
         ) : timeline?.items.length ? (
-          <div className="timeline-items">{timeline.items.map((item) => <TimelineRow item={item} key={item.id} />)}</div>
+          <div className="timeline-items">{timeline.items.map((item) => <TimelineRow item={item} onOpenFile={onOpenMarkdown} onOpenWeb={onOpenWeb} onError={onPreviewError} key={item.id} />)}</div>
         ) : (
           <div className="timeline-empty"><h2>这个任务还没有消息</h2><p>任务开始输出后，消息和工具操作会实时出现在这里。</p></div>
         )}
@@ -685,7 +753,7 @@ function TaskDetail({ task, timeline, onBack, onLoadOlder, onReload, onCancel, o
   );
 }
 
-function TasksView({ protocol, activeProject, busy, error, focusComposer, onCreate, onSend, onRename, onFork, onArchive, onCancel, onRefresh, onChooseProject, onOpenHarness, openSessionId, onOpenedSession }: TasksViewProps) {
+function TasksView({ protocol, activeProject, busy, error, focusComposer, onCreate, onSend, onRename, onFork, onArchive, onCancel, onRefresh, onChooseProject, onOpenHarness, onOpenMarkdown, onOpenWeb, onPreviewError, openSessionId, onOpenedSession }: TasksViewProps) {
   const [prompt, setPrompt] = useState("");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [timeline, setTimeline] = useState<TaskTimelineSnapshot>();
@@ -740,6 +808,9 @@ function TasksView({ protocol, activeProject, busy, error, focusComposer, onCrea
         onReload={() => void window.dshDesktop.getTaskTimeline(selectedTask.sessionId).then(setTimeline)}
         onCancel={() => onCancel(selectedTask.sessionId)}
         onOpenHarness={onOpenHarness}
+        onOpenMarkdown={(path) => onOpenMarkdown(selectedTask.sessionId, path)}
+        onOpenWeb={onOpenWeb}
+        onPreviewError={onPreviewError}
         onSend={(prompt, mode) => onSend(selectedTask.sessionId, prompt, mode)}
         onRename={(title) => onRename(selectedTask.sessionId, title)}
         onFork={async (atSeq) => { const child = await onFork(selectedTask.sessionId, atSeq); if (child) { setSelectedSessionId(child); setTimeline(undefined); } }}
@@ -866,11 +937,15 @@ export function App() {
   const [inboxError, setInboxError] = useState<string>();
   const [focusComposer, setFocusComposer] = useState(0);
   const [requestedTaskId, setRequestedTaskId] = useState<string>();
+  const [rightPreview, setRightPreview] = useState<RightPreview>();
+  const previewRequest = useRef(0);
 
   useEffect(() => {
     void window.dshDesktop.getSidecarStatus().then(setSnapshot);
     return window.dshDesktop.subscribeSidecar(setSnapshot);
   }, []);
+
+  useEffect(() => window.dshDesktop.subscribeBrowserOpenRequest((url) => setRightPreview({ kind: "web", url })), []);
 
   useEffect(() => {
     if (!initialView) void window.dshDesktop.getSettings().then((value) => { if (!value.credentialConfigured) setView("settings"); });
@@ -1080,12 +1155,27 @@ export function App() {
     }
   }
 
+  async function openMarkdown(sessionId: string, path: string) {
+    const request = ++previewRequest.current;
+    setRightPreview({ kind: "loading", title: path, sessionId });
+    const result = await window.dshDesktop.getTaskFilePreview(sessionId, path);
+    if (request !== previewRequest.current) return;
+    if (result.ok) setRightPreview({ kind: "markdown", sessionId, preview: result.preview });
+    else setRightPreview({ kind: "error", title: path, message: result.error });
+  }
+
+  function closeRightPreview() {
+    previewRequest.current += 1;
+    setRightPreview(undefined);
+    void window.dshDesktop.closeBrowserView();
+  }
+
   const isReady = snapshot.phase === "ready" && snapshot.adapter.phase === "ready";
   const isTransitioning = snapshot.phase === "starting" || snapshot.phase === "stopping";
   const inboxCount = protocol.approvals.length + protocol.questions.length + protocol.tasks.filter((task) => task.readyForReview && task.worktreeBranch && !task.archived && !task.error).length;
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${rightPreview ? " app-shell--preview" : ""}`}>
       <aside className="sidebar">
         <div className="traffic-light-space" aria-hidden="true" />
         <div className="product-mark">
@@ -1131,7 +1221,7 @@ export function App() {
       </aside>
 
       {view === "settings" ? (
-        <SettingsView runtime={snapshot} protocol={protocol} />
+        <SettingsView runtime={snapshot} protocol={protocol} onOpenWeb={(url) => setRightPreview({ kind: "web", url })} />
       ) : view === "inbox" ? (
         <InboxView protocol={protocol} error={inboxError} onApproval={(id, outcome) => void respondApproval(id, outcome)} onQuestion={(id, answers) => void respondQuestion(id, answers)} onOpenTask={(id) => { setRequestedTaskId(id); setView("tasks"); }} />
       ) : view === "projects" ? (
@@ -1160,6 +1250,9 @@ export function App() {
           onRefresh={() => void window.dshDesktop.refreshTasks().catch((error: unknown) => setTaskError(error instanceof Error ? error.message : String(error)))}
           onChooseProject={() => setView("projects")}
           onOpenHarness={() => void openHarness()}
+          onOpenMarkdown={(sessionId, path) => void openMarkdown(sessionId, path)}
+          onOpenWeb={(url) => setRightPreview({ kind: "web", url })}
+          onPreviewError={(message) => setRightPreview({ kind: "error", title: "链接无法打开", message })}
           openSessionId={requestedTaskId}
           onOpenedSession={() => setRequestedTaskId(undefined)}
         />
@@ -1277,6 +1370,7 @@ export function App() {
           </button>
         </footer>
       </main>}
+      {rightPreview && <RightPreviewPanel value={rightPreview} onClose={closeRightPreview} onOpenMarkdown={(sessionId, path) => void openMarkdown(sessionId, path)} onOpenWeb={(url) => setRightPreview({ kind: "web", url })} />}
     </div>
   );
 }

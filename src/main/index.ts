@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import {
   app,
   BrowserWindow,
+  WebContentsView,
   dialog,
   ipcMain,
   Menu,
@@ -17,7 +18,7 @@ import {
 } from "electron";
 import { HarnessSidecar } from "./harness-sidecar.js";
 import { HarnessGateway } from "./harness-gateway.js";
-import type { AdapterSnapshot, ProtocolSnapshot, SettingsSnapshot, SidecarSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
+import type { AdapterSnapshot, BrowserNavigationSnapshot, BrowserViewBounds, ProtocolSnapshot, SettingsSnapshot, SidecarSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
 import { ProjectStore } from "./project-store.js";
 import { assertProjectId, inspectProject } from "./project-inspector.js";
 import { HarnessProtocolClient } from "./harness-protocol-client.js";
@@ -28,7 +29,7 @@ import { parseWebAddress } from "./browser-policy.js";
 
 let mainWindow: BrowserWindow | undefined;
 let harnessWindow: BrowserWindow | undefined;
-let browserWindow: BrowserWindow | undefined;
+let browserView: WebContentsView | undefined;
 let browserSessionConfigured = false;
 let sidecar: HarnessSidecar;
 let projectStore: ProjectStore;
@@ -194,7 +195,7 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
 
 function installNavigationGuards(window: BrowserWindow, allowedOrigin?: string): void {
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) void openWebAddress(url);
+    if (/^https?:\/\//i.test(url) && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("browser:request-open", url);
     return { action: "deny" };
   });
   window.webContents.on("will-navigate", (event, target) => {
@@ -207,59 +208,87 @@ function installNavigationGuards(window: BrowserWindow, allowedOrigin?: string):
   });
 }
 
-async function openWebAddress(value: string): Promise<{ ok: true } | { ok: false; error: string }> {
+function parseBrowserBounds(value: unknown): BrowserViewBounds {
+  if (!value || typeof value !== "object") throw new Error("浏览器区域无效。");
+  const candidate = value as Partial<BrowserViewBounds>;
+  if (![candidate.x, candidate.y, candidate.width, candidate.height].every((part) => typeof part === "number" && Number.isFinite(part))) throw new Error("浏览器区域无效。");
+  const content = mainWindow?.getContentBounds();
+  if (!content) throw new Error("主窗口尚未就绪。");
+  const x = Math.max(0, Math.round(candidate.x ?? 0));
+  const y = Math.max(0, Math.round(candidate.y ?? 0));
+  const width = Math.max(1, Math.min(Math.round(candidate.width ?? 1), content.width - x));
+  const height = Math.max(1, Math.min(Math.round(candidate.height ?? 1), content.height - y));
+  if (x >= content.width || y >= content.height) throw new Error("浏览器区域超出主窗口。");
+  return { x, y, width, height };
+}
+
+function browserNavigationSnapshot(): BrowserNavigationSnapshot | undefined {
+  const contents = browserView?.webContents;
+  if (!contents || contents.isDestroyed()) return undefined;
+  return {
+    url: contents.getURL(),
+    title: contents.getTitle(),
+    canGoBack: contents.navigationHistory.canGoBack(),
+    canGoForward: contents.navigationHistory.canGoForward(),
+    loading: contents.isLoading(),
+  };
+}
+
+function broadcastBrowserNavigation(): void {
+  const snapshot = browserNavigationSnapshot();
+  if (snapshot && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("browser:navigation", snapshot);
+}
+
+function closeBrowserView(): void {
+  if (!browserView) return;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(browserView);
+  if (!browserView.webContents.isDestroyed()) browserView.webContents.close();
+  browserView = undefined;
+}
+
+function ensureBrowserView(): WebContentsView {
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主窗口尚未就绪。");
+  if (browserView && !browserView.webContents.isDestroyed()) return browserView;
+  browserView = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      partition: "dsh-browser-session",
+    },
+  });
+  mainWindow.contentView.addChildView(browserView);
+  if (!browserSessionConfigured) {
+    browserView.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+    browserView.webContents.session.on("will-download", (event) => event.preventDefault());
+    browserSessionConfigured = true;
+  }
+  browserView.webContents.setWindowOpenHandler(({ url: target }) => {
+    try { void browserView?.webContents.loadURL(parseWebAddress(target).toString()); } catch { /* Unsupported targets remain denied. */ }
+    return { action: "deny" };
+  });
+  const guard = (event: Electron.Event, target: string) => {
+    try { parseWebAddress(target); } catch { event.preventDefault(); }
+  };
+  browserView.webContents.on("will-navigate", guard);
+  browserView.webContents.on("will-redirect", guard);
+  browserView.webContents.on("did-start-loading", broadcastBrowserNavigation);
+  browserView.webContents.on("did-stop-loading", broadcastBrowserNavigation);
+  browserView.webContents.on("did-navigate", broadcastBrowserNavigation);
+  browserView.webContents.on("did-navigate-in-page", broadcastBrowserNavigation);
+  browserView.webContents.on("page-title-updated", broadcastBrowserNavigation);
+  return browserView;
+}
+
+async function openWebAddress(value: string, rawBounds: unknown): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const url = parseWebAddress(value);
-    if (!browserWindow || browserWindow.isDestroyed()) {
-      browserWindow = new BrowserWindow({
-        width: 1100,
-        height: 760,
-        minWidth: 720,
-        minHeight: 520,
-        title: "DSH 内置浏览器",
-        backgroundColor: nativeTheme.shouldUseDarkColors ? "#17171a" : "#ffffff",
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-          webSecurity: true,
-          allowRunningInsecureContent: false,
-          partition: "dsh-browser-session",
-        },
-      });
-      if (!browserSessionConfigured) {
-        browserWindow.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-        browserWindow.webContents.session.on("will-download", (event) => event.preventDefault());
-        browserSessionConfigured = true;
-      }
-      browserWindow.webContents.setWindowOpenHandler(({ url: target }) => {
-        try {
-          void browserWindow?.loadURL(parseWebAddress(target).toString());
-        } catch {
-          // Unsupported targets remain denied.
-        }
-        return { action: "deny" };
-      });
-      const guard = (event: Electron.Event, target: string) => {
-        try {
-          parseWebAddress(target);
-        } catch {
-          event.preventDefault();
-        }
-      };
-      browserWindow.webContents.on("will-navigate", guard);
-      browserWindow.webContents.on("will-redirect", guard);
-      browserWindow.webContents.on("before-input-event", (event, input) => {
-        if (!input.meta || input.type !== "keyDown") return;
-        if (input.key === "[" && browserWindow?.webContents.canGoBack()) { event.preventDefault(); browserWindow.webContents.goBack(); }
-        if (input.key === "]" && browserWindow?.webContents.canGoForward()) { event.preventDefault(); browserWindow.webContents.goForward(); }
-        if (input.key.toLowerCase() === "r") { event.preventDefault(); browserWindow?.webContents.reload(); }
-      });
-      browserWindow.on("closed", () => { browserWindow = undefined; });
-    }
-    await browserWindow.loadURL(url.toString());
-    browserWindow.show();
-    browserWindow.focus();
+    const view = ensureBrowserView();
+    view.setBounds(parseBrowserBounds(rawBounds));
+    await view.webContents.loadURL(url.toString());
+    broadcastBrowserNavigation();
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -277,7 +306,7 @@ async function createMainWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 760,
-    minWidth: 960,
+    minWidth: 1080,
     minHeight: 640,
     titleBarStyle: "hiddenInset",
     backgroundColor: nativeTheme.shouldUseDarkColors ? "#111114" : "#f7f7f8",
@@ -289,6 +318,7 @@ async function createMainWindow(): Promise<void> {
     },
   });
   mainWindow.once("closed", () => {
+    closeBrowserView();
     mainWindow = undefined;
   });
   mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
@@ -370,9 +400,21 @@ function installIpc(): void {
   ipcMain.handle("sidecar:stop", () => sidecar.stop());
   ipcMain.handle("sidecar:restart", () => sidecar.restart());
   ipcMain.handle("harness:open", () => openHarnessWindow());
-  ipcMain.handle("browser:open", (_event, url: unknown) => {
+  ipcMain.handle("browser:open", (_event, url: unknown, bounds: unknown) => {
     if (typeof url !== "string") return { ok: false, error: "网址无效。" } as const;
-    return openWebAddress(url);
+    return openWebAddress(url, bounds);
+  });
+  ipcMain.handle("browser:bounds", (_event, bounds: unknown) => {
+    try { browserView?.setBounds(parseBrowserBounds(bounds)); return { ok: true } as const; }
+    catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } as const; }
+  });
+  ipcMain.handle("browser:close", () => closeBrowserView());
+  ipcMain.handle("browser:navigate", (_event, action: unknown) => {
+    const contents = browserView?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    if (action === "back" && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+    else if (action === "forward" && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+    else if (action === "reload") contents.reload();
   });
   ipcMain.handle("projects:list", () => projectStore.list());
   ipcMain.handle("projects:choose", async () => {

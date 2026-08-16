@@ -35,7 +35,20 @@ contextBridge.exposeInMainWorld("dshDesktop", {
   commitTask: (sessionId, message) => ipcRenderer.invoke("review:commit", sessionId, message),
   discardTaskWorkspace: (sessionId) => ipcRenderer.invoke("review:discard", sessionId),
   openTaskWorkspace: (sessionId, target) => ipcRenderer.invoke("review:open", sessionId, target),
-  openWebAddress: (url) => ipcRenderer.invoke("browser:open", url),
+  openWebAddress: (url, bounds) => ipcRenderer.invoke("browser:open", url, bounds),
+  setBrowserViewBounds: (bounds) => ipcRenderer.invoke("browser:bounds", bounds),
+  closeBrowserView: () => ipcRenderer.invoke("browser:close"),
+  navigateBrowserView: (action) => ipcRenderer.invoke("browser:navigate", action),
+  subscribeBrowserNavigation: (listener) => {
+    const handler = (_event, snapshot) => listener(snapshot);
+    ipcRenderer.on("browser:navigation", handler);
+    return () => ipcRenderer.removeListener("browser:navigation", handler);
+  },
+  subscribeBrowserOpenRequest: (listener) => {
+    const handler = (_event, url) => listener(url);
+    ipcRenderer.on("browser:request-open", handler);
+    return () => ipcRenderer.removeListener("browser:request-open", handler);
+  },
   getSettings: () => ipcRenderer.invoke("settings:get"),
   saveSettings: (input) => ipcRenderer.invoke("settings:save", input),
   testModelConnection: (input) => ipcRenderer.invoke("settings:test", input),
