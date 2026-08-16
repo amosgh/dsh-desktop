@@ -21,6 +21,7 @@ import { ProjectStore } from "./project-store.js";
 import { assertProjectId, inspectProject } from "./project-inspector.js";
 import { HarnessProtocolClient } from "./harness-protocol-client.js";
 import { GitService } from "./git-service.js";
+import { testModelConnection } from "./model-connection.js";
 
 let mainWindow: BrowserWindow | undefined;
 let harnessWindow: BrowserWindow | undefined;
@@ -168,6 +169,13 @@ function installNavigationGuards(window: BrowserWindow, allowedOrigin?: string):
 }
 
 async function createMainWindow(): Promise<void> {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    return;
+  }
+
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 760,
@@ -181,6 +189,9 @@ async function createMainWindow(): Promise<void> {
       nodeIntegration: false,
       sandbox: true,
     },
+  });
+  mainWindow.once("closed", () => {
+    mainWindow = undefined;
   });
   mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
   installNavigationGuards(mainWindow);
@@ -525,7 +536,7 @@ function installIpc(): void {
       const baseURL = validateBaseURL(String(value.baseURL ?? ""));
       const apiKey = typeof value.apiKey === "string" && value.apiKey.trim() ? value.apiKey.trim() : readStoredSecret();
       if (!apiKey) throw new Error("请先输入 DeepSeek API Key。");
-      const models = await protocol.discoverModels(baseURL, apiKey);
+      const models = await testModelConnection(baseURL, apiKey);
       return { ok: true, models } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
@@ -565,6 +576,7 @@ function installMenu(): void {
           { role: "quit" },
         ],
       },
+      { role: "editMenu" },
       {
         label: "项目",
         submenu: [
@@ -658,7 +670,7 @@ app.whenReady().then(async () => {
   });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) void createMainWindow();
+    void createMainWindow();
   });
 }).catch((error: unknown) => {
   console.error("DSH Desktop startup failed.", error);

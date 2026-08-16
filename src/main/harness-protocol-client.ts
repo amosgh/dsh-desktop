@@ -173,17 +173,6 @@ export class HarnessProtocolClient extends EventEmitter {
     this.#defaultModel = normalized;
   }
 
-  async discoverModels(baseURL: string, apiKey?: string): Promise<string[]> {
-    const value = await this.#rpc<unknown>("llm.discoverModels", {
-      settingsNs: "llm-deepseek",
-      provider: "deepseek-official",
-      baseURL,
-      ...(apiKey ? { apiKey } : {}),
-    });
-    if (!isObject(value) || !Array.isArray(value.models)) throw new Error("Harness returned an invalid model catalog.");
-    return value.models.flatMap((model) => isObject(model) && typeof model.id === "string" ? [model.id] : []);
-  }
-
   async respondApproval(approvalId: string, outcome: "allowed-once" | "rejected"): Promise<void> {
     const approval = this.#approvals.get(approvalId);
     if (!approval) throw new Error("该审批已失效或已处理。");

@@ -299,7 +299,7 @@ function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protoco
   async function testConnection() {
     setBusy(true); setMessage(undefined);
     const result = await window.dshDesktop.testModelConnection({ ...(apiKey.trim() ? { apiKey } : {}), baseURL });
-    setMessage(result.ok ? { kind: "success", text: `连接成功，发现 ${result.models.length} 个模型。` } : { kind: "error", text: result.error });
+    setMessage(result.ok ? { kind: "success", text: `连接成功，服务返回 ${result.models.length} 个可用模型。` } : { kind: "error", text: result.error });
     setBusy(false);
   }
 
