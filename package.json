@@ -10,8 +10,11 @@
   "engines": {
     "node": ">=24.0.0"
   },
+  "packageManager": "npm@11.12.1",
   "scripts": {
-    "dev": "npm run build:main && concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env DSH_DESKTOP_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "postinstall": "node node_modules/electron/install.js",
+    "prepare:electron": "node node_modules/electron/install.js",
+    "dev": "npm run prepare:electron && npm run build:main && concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env DSH_DESKTOP_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build": "npm run clean && npm run build:main && npm run build:renderer",
     "build:main": "tsc -p tsconfig.main.json && node scripts/copy-static.mjs",
     "build:renderer": "vite build",
@@ -23,9 +26,9 @@
     "smoke:protocol": "npm run build:main && node scripts/smoke-protocol.mjs",
     "smoke:recovery": "npm run build:main && node scripts/smoke-recovery.mjs",
     "verify": "npm run typecheck && npm test && npm run smoke:protocol && npm run smoke:recovery",
-    "start": "electron .",
-    "dist:mac": "npm run prepare:runtime && npm run build && electron-builder --mac dir --config.electronDist=node_modules/electron/dist",
-    "dist:release": "npm run prepare:runtime && npm run build && electron-builder --mac dmg zip --config.electronDist=node_modules/electron/dist"
+    "start": "npm run prepare:electron && electron .",
+    "dist:mac": "npm run prepare:electron && npm run prepare:runtime && npm run build && electron-builder --mac dir --config.electronDist=node_modules/electron/dist",
+    "dist:release": "npm run prepare:electron && npm run prepare:runtime && npm run build && electron-builder --mac dmg zip --config.electronDist=node_modules/electron/dist"
   },
   "dependencies": {
     "@deepseek-ai/dsh": "0.1.0-rc.6",
@@ -69,6 +72,7 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "icon": "build/icon-1024.png",
+      "minimumSystemVersion": "14.0",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",

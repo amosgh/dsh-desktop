@@ -22,6 +22,9 @@
 ### 发布说明
 
 - 本版本发布源码与版本说明。
+- 完善 GitHub 源码安装、环境检查、首次配置、验证、打包和常见问题说明。
+- 明确要求 macOS 14+、Apple Silicon、原生 arm64 Node.js 24+，并在打包配置中声明最低系统版本。
+- 修复干净 `npm ci` 后缺少 Electron runtime、导致开发启动和打包失败的问题。
 - 未附带未经 Developer ID 签名和 Apple 公证的 macOS 安装包。
 
 ## [0.0.1] - 2026-08-16

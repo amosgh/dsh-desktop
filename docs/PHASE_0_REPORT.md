@@ -10,7 +10,7 @@ Status: complete for runtime and packaging proof; protocol work is intentionally
 - Keeps Electron Renderer sandboxed behind a narrow preload API.
 - Stores Harness state beneath the application support directory and redacts sidecar logs before exposing them to the UI.
 - Opens the upstream Harness workspace in a separate sandboxed window.
-- Packages and launches an unsigned Apple Silicon `.app` with a dedicated universal Node runtime.
+- Packages and launches an unsigned Apple Silicon `.app` with a dedicated Node runtime copied from the build environment and verified to contain an arm64 slice.
 - Confirmed from the packaged process tree that Harness runs from `Contents/Resources/runtime/node` rather than the user's shell.
 
 ## Important findings
