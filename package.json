@@ -1,0 +1,86 @@
+{
+  "name": "dsh-desktop",
+  "version": "0.0.1",
+  "private": true,
+  "description": "A local-first macOS control plane for DeepSeek Harness.",
+  "author": "DSH Desktop contributors",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/main/index.js",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "npm run build:main && concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env DSH_DESKTOP_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "npm run clean && npm run build:main && npm run build:renderer",
+    "build:main": "tsc -p tsconfig.main.json && node scripts/copy-static.mjs",
+    "build:renderer": "vite build",
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "clean": "node scripts/clean.mjs",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "smoke:harness": "node scripts/smoke-harness.mjs",
+    "smoke:protocol": "npm run build:main && node scripts/smoke-protocol.mjs",
+    "smoke:recovery": "npm run build:main && node scripts/smoke-recovery.mjs",
+    "verify": "npm run typecheck && npm test && npm run smoke:protocol && npm run smoke:recovery",
+    "start": "electron .",
+    "dist:mac": "npm run prepare:runtime && npm run build && electron-builder --mac dir --config.electronDist=node_modules/electron/dist",
+    "dist:release": "npm run prepare:runtime && npm run build && electron-builder --mac dmg zip --config.electronDist=node_modules/electron/dist"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.10",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.1",
+    "concurrently": "9.2.1",
+    "cross-env": "10.1.0",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.10",
+    "wait-on": "9.0.4"
+  },
+  "build": {
+    "appId": "community.dsh.desktop",
+    "productName": "DSH Desktop",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "runtime/node",
+        "to": "runtime/node"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon-1024.png",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ]
+    }
+  }
+}
