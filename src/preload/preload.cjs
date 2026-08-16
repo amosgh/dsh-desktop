@@ -31,9 +31,24 @@ contextBridge.exposeInMainWorld("dshDesktop", {
   archiveTask: (sessionId) => ipcRenderer.invoke("tasks:archive", sessionId),
   getTaskReview: (sessionId) => ipcRenderer.invoke("review:get", sessionId),
   getTaskFileDiff: (sessionId, path) => ipcRenderer.invoke("review:diff", sessionId, path),
+  getTaskFilePreview: (sessionId, path) => ipcRenderer.invoke("review:preview", sessionId, path),
   commitTask: (sessionId, message) => ipcRenderer.invoke("review:commit", sessionId, message),
   discardTaskWorkspace: (sessionId) => ipcRenderer.invoke("review:discard", sessionId),
   openTaskWorkspace: (sessionId, target) => ipcRenderer.invoke("review:open", sessionId, target),
+  openWebAddress: (url, bounds) => ipcRenderer.invoke("browser:open", url, bounds),
+  setBrowserViewBounds: (bounds) => ipcRenderer.invoke("browser:bounds", bounds),
+  closeBrowserView: () => ipcRenderer.invoke("browser:close"),
+  navigateBrowserView: (action) => ipcRenderer.invoke("browser:navigate", action),
+  subscribeBrowserNavigation: (listener) => {
+    const handler = (_event, snapshot) => listener(snapshot);
+    ipcRenderer.on("browser:navigation", handler);
+    return () => ipcRenderer.removeListener("browser:navigation", handler);
+  },
+  subscribeBrowserOpenRequest: (listener) => {
+    const handler = (_event, url) => listener(url);
+    ipcRenderer.on("browser:request-open", handler);
+    return () => ipcRenderer.removeListener("browser:request-open", handler);
+  },
   getSettings: () => ipcRenderer.invoke("settings:get"),
   saveSettings: (input) => ipcRenderer.invoke("settings:save", input),
   testModelConnection: (input) => ipcRenderer.invoke("settings:test", input),
@@ -61,5 +76,10 @@ contextBridge.exposeInMainWorld("dshDesktop", {
     const handler = () => listener();
     ipcRenderer.on("inbox:focus", handler);
     return () => ipcRenderer.removeListener("inbox:focus", handler);
+  },
+  subscribeSettingsOpen: (listener) => {
+    const handler = () => listener();
+    ipcRenderer.on("settings:open-requested", handler);
+    return () => ipcRenderer.removeListener("settings:open-requested", handler);
   },
 });

@@ -1,10 +1,12 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { access, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import {
   app,
   BrowserWindow,
+  WebContentsView,
   dialog,
   ipcMain,
   Menu,
@@ -16,14 +18,23 @@ import {
 } from "electron";
 import { HarnessSidecar } from "./harness-sidecar.js";
 import { HarnessGateway } from "./harness-gateway.js";
-import type { AdapterSnapshot, ProtocolSnapshot, SettingsSnapshot, SidecarSnapshot } from "../shared/contracts.js";
+import type { AdapterSnapshot, BrowserNavigationSnapshot, BrowserViewBounds, ProtocolSnapshot, SettingsSnapshot, SidecarSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
 import { ProjectStore } from "./project-store.js";
 import { assertProjectId, inspectProject } from "./project-inspector.js";
 import { HarnessProtocolClient } from "./harness-protocol-client.js";
 import { GitService } from "./git-service.js";
+import { testModelConnection } from "./model-connection.js";
+import { safeSettingsDiagnostics } from "./diagnostics.js";
+import { parseWebAddress } from "./browser-policy.js";
+import { htmlDataURL, markdownDocument, previewChromeDocument, previewStateDocument, readHarnessMarkdown } from "./harness-preview.js";
 
 let mainWindow: BrowserWindow | undefined;
 let harnessWindow: BrowserWindow | undefined;
+let browserView: WebContentsView | undefined;
+let harnessPreviewChrome: WebContentsView | undefined;
+let harnessPreviewContent: WebContentsView | undefined;
+let harnessPreviewMode: "markdown" | "web" | undefined;
+const configuredBrowserSessions = new Set<string>();
 let sidecar: HarnessSidecar;
 let projectStore: ProjectStore;
 let gitService: GitService;
@@ -32,8 +43,12 @@ const gateway = new HarnessGateway();
 const protocol = new HarnessProtocolClient();
 let gatewayUpstream: string | undefined;
 let gatewayEpoch = 0;
+let gatewayRetryAttempt = 0;
+let gatewayRetryTimer: NodeJS.Timeout | undefined;
 const notifiedRequests = new Set<string>();
+const currentNotifications = new Map<string, { title: string; body: string }>();
 let appliedModelGeneration = 0;
+const execFileAsync = promisify(execFile);
 let adapter: AdapterSnapshot = {
   phase: "locked",
   protocolVersion: "1",
@@ -109,12 +124,32 @@ function broadcast(snapshot: SidecarSnapshot): void {
 }
 
 function closeHarnessWindow(): void {
+  closeHarnessPreview();
   if (harnessWindow && !harnessWindow.isDestroyed()) harnessWindow.close();
   harnessWindow = undefined;
 }
 
+function clearGatewayRetry(): void {
+  if (gatewayRetryTimer) clearTimeout(gatewayRetryTimer);
+  gatewayRetryTimer = undefined;
+}
+
+function scheduleGatewayRetry(snapshot: SidecarSnapshot): void {
+  if (gatewayRetryTimer || gatewayRetryAttempt >= 5 || snapshot.phase !== "ready" || !snapshot.url) return;
+  gatewayRetryAttempt += 1;
+  const expectedUrl = snapshot.url;
+  const delay = Math.min(8_000, 500 * 2 ** (gatewayRetryAttempt - 1));
+  gatewayRetryTimer = setTimeout(() => {
+    gatewayRetryTimer = undefined;
+    if (sidecar.snapshot.phase === "ready" && sidecar.snapshot.url === expectedUrl) void reconcileGateway(sidecar.snapshot);
+  }, delay);
+  gatewayRetryTimer.unref();
+}
+
 async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
   if (snapshot.phase !== "ready" || !snapshot.url) {
+    clearGatewayRetry();
+    gatewayRetryAttempt = 0;
     const epoch = ++gatewayEpoch;
     gatewayUpstream = undefined;
     adapter = { phase: "locked", protocolVersion: "1", authenticated: false };
@@ -125,12 +160,16 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
     broadcast(snapshot);
     return;
   }
-  if (gatewayUpstream === snapshot.url && ["starting", "ready"].includes(adapter.phase)) {
+  if (gatewayUpstream === snapshot.url && (["starting", "ready"].includes(adapter.phase) || (adapter.phase === "error" && (Boolean(gatewayRetryTimer) || gatewayRetryAttempt >= 5)))) {
     broadcast(snapshot);
     return;
   }
 
   const epoch = ++gatewayEpoch;
+  if (gatewayUpstream !== snapshot.url) {
+    clearGatewayRetry();
+    gatewayRetryAttempt = 0;
+  }
   gatewayUpstream = snapshot.url;
   protocol.connect(snapshot.url);
   adapter = { phase: "starting", protocolVersion: "1", authenticated: false };
@@ -144,6 +183,8 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
       authenticated: true,
       endpoint: session.endpoint,
     };
+    clearGatewayRetry();
+    gatewayRetryAttempt = 0;
   } catch (error) {
     if (epoch !== gatewayEpoch) return;
     adapter = {
@@ -152,26 +193,243 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
       authenticated: false,
       error: error instanceof Error ? error.message : String(error),
     };
+    scheduleGatewayRetry(snapshot);
   }
   broadcast(snapshot);
 }
 
 function installNavigationGuards(window: BrowserWindow, allowedOrigin?: string): void {
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("https://")) void shell.openExternal(url);
+    if (/^https?:\/\//i.test(url) && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("browser:request-open", url);
     return { action: "deny" };
   });
   window.webContents.on("will-navigate", (event, target) => {
-    if (allowedOrigin && new URL(target).origin === allowedOrigin) return;
+    try {
+      if (allowedOrigin && new URL(target).origin === allowedOrigin) return;
+    } catch {
+      // Malformed navigation targets are denied below.
+    }
     event.preventDefault();
   });
 }
 
+function parseBrowserBounds(value: unknown): BrowserViewBounds {
+  if (!value || typeof value !== "object") throw new Error("浏览器区域无效。");
+  const candidate = value as Partial<BrowserViewBounds>;
+  if (![candidate.x, candidate.y, candidate.width, candidate.height].every((part) => typeof part === "number" && Number.isFinite(part))) throw new Error("浏览器区域无效。");
+  const content = mainWindow?.getContentBounds();
+  if (!content) throw new Error("主窗口尚未就绪。");
+  const x = Math.max(0, Math.round(candidate.x ?? 0));
+  const y = Math.max(0, Math.round(candidate.y ?? 0));
+  const width = Math.max(1, Math.min(Math.round(candidate.width ?? 1), content.width - x));
+  const height = Math.max(1, Math.min(Math.round(candidate.height ?? 1), content.height - y));
+  if (x >= content.width || y >= content.height) throw new Error("浏览器区域超出主窗口。");
+  return { x, y, width, height };
+}
+
+function browserNavigationSnapshot(): BrowserNavigationSnapshot | undefined {
+  const contents = browserView?.webContents;
+  if (!contents || contents.isDestroyed()) return undefined;
+  return {
+    url: contents.getURL(),
+    title: contents.getTitle(),
+    canGoBack: contents.navigationHistory.canGoBack(),
+    canGoForward: contents.navigationHistory.canGoForward(),
+    loading: contents.isLoading(),
+  };
+}
+
+function broadcastBrowserNavigation(): void {
+  const snapshot = browserNavigationSnapshot();
+  if (snapshot && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("browser:navigation", snapshot);
+}
+
+function closeBrowserView(): void {
+  if (!browserView) return;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.contentView.removeChildView(browserView);
+  if (!browserView.webContents.isDestroyed()) browserView.webContents.close();
+  browserView = undefined;
+}
+
+function ensureBrowserView(): WebContentsView {
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error("主窗口尚未就绪。");
+  if (browserView && !browserView.webContents.isDestroyed()) return browserView;
+  browserView = new WebContentsView({
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      partition: "dsh-browser-session",
+    },
+  });
+  mainWindow.contentView.addChildView(browserView);
+  if (!configuredBrowserSessions.has("main-browser")) {
+    browserView.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+    browserView.webContents.session.on("will-download", (event) => event.preventDefault());
+    configuredBrowserSessions.add("main-browser");
+  }
+  browserView.webContents.setWindowOpenHandler(({ url: target }) => {
+    try { void browserView?.webContents.loadURL(parseWebAddress(target).toString()); } catch { /* Unsupported targets remain denied. */ }
+    return { action: "deny" };
+  });
+  const guard = (event: Electron.Event, target: string) => {
+    try { parseWebAddress(target); } catch { event.preventDefault(); }
+  };
+  browserView.webContents.on("will-navigate", guard);
+  browserView.webContents.on("will-redirect", guard);
+  browserView.webContents.on("did-start-loading", broadcastBrowserNavigation);
+  browserView.webContents.on("did-stop-loading", broadcastBrowserNavigation);
+  browserView.webContents.on("did-navigate", broadcastBrowserNavigation);
+  browserView.webContents.on("did-navigate-in-page", broadcastBrowserNavigation);
+  browserView.webContents.on("page-title-updated", broadcastBrowserNavigation);
+  return browserView;
+}
+
+function harnessPreviewWidth(): number {
+  const width = harnessWindow?.getContentBounds().width ?? 1280;
+  return Math.max(380, Math.min(620, Math.round(width * 0.42)));
+}
+
+function updateHarnessPreviewLayout(): void {
+  if (!harnessWindow || harnessWindow.isDestroyed() || !harnessPreviewChrome || !harnessPreviewContent) return;
+  const bounds = harnessWindow.getContentBounds();
+  const width = harnessPreviewWidth();
+  const x = Math.max(0, bounds.width - width);
+  harnessPreviewChrome.setBounds({ x, y: 0, width, height: 52 });
+  harnessPreviewContent.setBounds({ x, y: 52, width, height: Math.max(1, bounds.height - 52) });
+  void harnessWindow.webContents.executeJavaScript(`(() => { let style = document.getElementById("dsh-desktop-preview-layout"); if (!style) { style = document.createElement("style"); style.id = "dsh-desktop-preview-layout"; document.head.append(style); } style.textContent = ${JSON.stringify(`#root { width: calc(100vw - ${width}px) !important; max-width: calc(100vw - ${width}px) !important; overflow-x: hidden !important; }`)}; })()`);
+}
+
+function closeHarnessPreview(): void {
+  if (harnessWindow && !harnessWindow.isDestroyed()) {
+    if (harnessPreviewChrome) harnessWindow.contentView.removeChildView(harnessPreviewChrome);
+    if (harnessPreviewContent) harnessWindow.contentView.removeChildView(harnessPreviewContent);
+    void harnessWindow.webContents.executeJavaScript('document.getElementById("dsh-desktop-preview-layout")?.remove()');
+  }
+  if (harnessPreviewChrome && !harnessPreviewChrome.webContents.isDestroyed()) harnessPreviewChrome.webContents.close();
+  if (harnessPreviewContent && !harnessPreviewContent.webContents.isDestroyed()) harnessPreviewContent.webContents.close();
+  harnessPreviewChrome = undefined;
+  harnessPreviewContent = undefined;
+  harnessPreviewMode = undefined;
+}
+
+function handleHarnessPreviewTarget(target: string): boolean {
+  let url: URL;
+  try { url = new URL(target); } catch { return false; }
+  if (url.protocol !== "dsh-preview:") return false;
+  const action = url.hostname;
+  if (action === "close") closeHarnessPreview();
+  else if (action === "file") {
+    const path = url.searchParams.get("path");
+    if (path) void openHarnessMarkdownPreview(path);
+  } else if (action === "web") {
+    const value = url.searchParams.get("url");
+    if (value) void openHarnessWebPreview(value);
+  } else if (action === "back" && harnessPreviewContent?.webContents.navigationHistory.canGoBack()) harnessPreviewContent.webContents.navigationHistory.goBack();
+  else if (action === "forward" && harnessPreviewContent?.webContents.navigationHistory.canGoForward()) harnessPreviewContent.webContents.navigationHistory.goForward();
+  else if (action === "reload") harnessPreviewContent?.webContents.reload();
+  return true;
+}
+
+function ensureHarnessPreviewViews(): { chrome: WebContentsView; content: WebContentsView } {
+  if (!harnessWindow || harnessWindow.isDestroyed()) throw new Error("Harness 窗口尚未打开。");
+  if (harnessPreviewChrome && harnessPreviewContent && !harnessPreviewChrome.webContents.isDestroyed() && !harnessPreviewContent.webContents.isDestroyed()) return { chrome: harnessPreviewChrome, content: harnessPreviewContent };
+  const preferences = { contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, allowRunningInsecureContent: false, partition: "dsh-harness-preview-session" } as const;
+  harnessPreviewChrome = new WebContentsView({ webPreferences: preferences });
+  harnessPreviewContent = new WebContentsView({ webPreferences: preferences });
+  harnessWindow.contentView.addChildView(harnessPreviewChrome);
+  harnessWindow.contentView.addChildView(harnessPreviewContent);
+  if (!configuredBrowserSessions.has("harness-preview")) {
+    harnessPreviewContent.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+    harnessPreviewContent.webContents.session.on("will-download", (event) => event.preventDefault());
+    configuredBrowserSessions.add("harness-preview");
+  }
+  for (const view of [harnessPreviewChrome, harnessPreviewContent]) {
+    view.webContents.setWindowOpenHandler(({ url }) => {
+      if (!handleHarnessPreviewTarget(url) && view === harnessPreviewContent && harnessPreviewMode === "web") {
+        try { void view.webContents.loadURL(parseWebAddress(url).toString()); } catch { /* Unsupported targets remain denied. */ }
+      }
+      return { action: "deny" };
+    });
+    view.webContents.on("will-navigate", (event, target) => {
+      if (handleHarnessPreviewTarget(target)) { event.preventDefault(); return; }
+      if (view === harnessPreviewContent && harnessPreviewMode === "web") {
+        try { parseWebAddress(target); return; } catch { /* Denied below. */ }
+      }
+      if (!target.startsWith("data:text/html")) event.preventDefault();
+    });
+  }
+  updateHarnessPreviewLayout();
+  return { chrome: harnessPreviewChrome, content: harnessPreviewContent };
+}
+
+function harnessPreviewRoots(): string[] {
+  return [...new Set([
+    ...projectStore.list().map((project) => project.path),
+    ...projectStore.listTaskWorkspaces().flatMap((workspace) => [workspace.worktreePath, workspace.repositoryPath]),
+    ...protocol.snapshot.tasks.flatMap((task) => [task.cwd, task.projectPath].filter((path): path is string => Boolean(path))),
+  ])];
+}
+
+async function openHarnessMarkdownPreview(path: string): Promise<void> {
+  if (!harnessWindow || harnessWindow.isDestroyed()) throw new Error("Harness 窗口尚未打开。");
+  const { chrome, content } = ensureHarnessPreviewViews();
+  harnessPreviewMode = "markdown";
+  const dark = nativeTheme.shouldUseDarkColors;
+  try {
+    const preview = await readHarnessMarkdown(path, harnessPreviewRoots());
+    await Promise.all([
+      chrome.webContents.loadURL(htmlDataURL(previewChromeDocument(basename(preview.path), preview.path, dark))),
+      content.webContents.loadURL(htmlDataURL(markdownDocument(preview, dark))),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await Promise.all([
+      chrome.webContents.loadURL(htmlDataURL(previewChromeDocument(basename(path), path, dark))),
+      content.webContents.loadURL(htmlDataURL(previewStateDocument("无法打开 Markdown", message, dark))),
+    ]);
+  }
+  updateHarnessPreviewLayout();
+  harnessWindow.show();
+  harnessWindow.focus();
+}
+
+async function openHarnessWebPreview(value: string): Promise<void> {
+  const url = parseWebAddress(value);
+  const { chrome, content } = ensureHarnessPreviewViews();
+  harnessPreviewMode = "web";
+  await chrome.webContents.loadURL(htmlDataURL(previewChromeDocument(url.hostname, url.toString(), nativeTheme.shouldUseDarkColors, true)));
+  await content.webContents.loadURL(url.toString());
+  updateHarnessPreviewLayout();
+}
+
+async function openWebAddress(value: string, rawBounds: unknown): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const url = parseWebAddress(value);
+    const view = ensureBrowserView();
+    view.setBounds(parseBrowserBounds(rawBounds));
+    await view.webContents.loadURL(url.toString());
+    broadcastBrowserNavigation();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 async function createMainWindow(): Promise<void> {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    return;
+  }
+
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 760,
-    minWidth: 960,
+    minWidth: 1080,
     minHeight: 640,
     titleBarStyle: "hiddenInset",
     backgroundColor: nativeTheme.shouldUseDarkColors ? "#111114" : "#f7f7f8",
@@ -181,6 +439,10 @@ async function createMainWindow(): Promise<void> {
       nodeIntegration: false,
       sandbox: true,
     },
+  });
+  mainWindow.once("closed", () => {
+    closeBrowserView();
+    mainWindow = undefined;
   });
   mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
   installNavigationGuards(mainWindow);
@@ -249,8 +511,10 @@ async function openHarnessWindow(): Promise<{ ok: true } | { ok: false; error: s
     console.log(`Harness workspace loaded through authenticated adapter ${gatewaySession.endpoint}`);
   });
   harnessWindow.once("closed", () => {
+    closeHarnessPreview();
     harnessWindow = undefined;
   });
+  harnessWindow.on("resize", updateHarnessPreviewLayout);
   await harnessWindow.loadURL(gatewaySession.endpoint);
   return { ok: true };
 }
@@ -261,6 +525,22 @@ function installIpc(): void {
   ipcMain.handle("sidecar:stop", () => sidecar.stop());
   ipcMain.handle("sidecar:restart", () => sidecar.restart());
   ipcMain.handle("harness:open", () => openHarnessWindow());
+  ipcMain.handle("browser:open", (_event, url: unknown, bounds: unknown) => {
+    if (typeof url !== "string") return { ok: false, error: "网址无效。" } as const;
+    return openWebAddress(url, bounds);
+  });
+  ipcMain.handle("browser:bounds", (_event, bounds: unknown) => {
+    try { browserView?.setBounds(parseBrowserBounds(bounds)); return { ok: true } as const; }
+    catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) } as const; }
+  });
+  ipcMain.handle("browser:close", () => closeBrowserView());
+  ipcMain.handle("browser:navigate", (_event, action: unknown) => {
+    const contents = browserView?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    if (action === "back" && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+    else if (action === "forward" && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+    else if (action === "reload") contents.reload();
+  });
   ipcMain.handle("projects:list", () => projectStore.list());
   ipcMain.handle("projects:choose", async () => {
     const options: OpenDialogOptions = {
@@ -339,18 +619,30 @@ function installIpc(): void {
   ipcMain.handle("protocol:get", () => protocol.snapshot);
   ipcMain.handle("protocol:refresh", () => protocol.refresh());
   ipcMain.handle("tasks:create", async (_event, prompt: unknown) => {
+    let workspace: TaskWorkspaceRecord | undefined;
     try {
       if (typeof prompt !== "string") throw new Error("任务内容无效。");
       const activeProject = projectStore.list().find((project) => project.active);
       if (!activeProject) throw new Error("请先添加并选择一个项目。");
       const sessionId = randomUUID();
-      const workspace = await gitService.createWorktree(activeProject.id, activeProject.path, sessionId);
+      workspace = await gitService.createWorktree(activeProject.id, activeProject.path, sessionId);
       projectStore.saveTaskWorkspace(workspace);
-      protocol.registerTaskWorkspace(sessionId, activeProject.path, workspace.branch);
+      protocol.registerTaskWorkspace(sessionId, activeProject.path, workspace.branch, workspace.state);
       await protocol.createTask(workspace.worktreePath, prompt, sessionId);
       return { ok: true, sessionId } as const;
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!workspace) return { ok: false, error: message } as const;
+      protocol.unregisterTaskWorkspace(workspace.sessionId);
+      try {
+        await gitService.rollbackWorktree(workspace);
+        projectStore.deleteTaskWorkspace(workspace.sessionId);
+        return { ok: false, error: message } as const;
+      } catch (cleanupError) {
+        projectStore.updateTaskWorkspaceState(workspace.sessionId, "missing");
+        const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        return { ok: false, error: `${message}；自动清理 worktree 失败：${cleanupMessage}` } as const;
+      }
     }
   });
   ipcMain.handle("tasks:cancel", async (_event, sessionId: unknown) => {
@@ -431,15 +723,25 @@ function installIpc(): void {
   ipcMain.handle("review:get", async (_event, sessionId: unknown) => {
     if (typeof sessionId !== "string") throw new Error("任务标识无效。");
     const workspace = projectStore.getTaskWorkspace(sessionId);
-    if (!workspace || workspace.state === "discarded") return { sessionId, phase: "unavailable", files: [], additions: 0, deletions: 0, clean: true } as const;
+    if (!workspace || workspace.state === "discarded" || workspace.state === "missing") return { sessionId, phase: "unavailable", files: [], additions: 0, deletions: 0, clean: true, error: workspace?.state === "missing" ? "任务 worktree 已丢失或被外部移除。" : undefined } as const;
     return gitService.review(workspace);
   });
   ipcMain.handle("review:diff", async (_event, sessionId: unknown, path: unknown) => {
     try {
       if (typeof sessionId !== "string" || typeof path !== "string") throw new Error("差异参数无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
-      if (!workspace || workspace.state === "discarded") throw new Error("任务 worktree 不可用。");
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
       return { ok: true, diff: await gitService.diff(workspace, path) } as const;
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
+    }
+  });
+  ipcMain.handle("review:preview", async (_event, sessionId: unknown, path: unknown) => {
+    try {
+      if (typeof sessionId !== "string" || typeof path !== "string") throw new Error("预览参数无效。");
+      const workspace = projectStore.getTaskWorkspace(sessionId);
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
+      return { ok: true, preview: await gitService.preview(workspace, path) } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
     }
@@ -448,9 +750,10 @@ function installIpc(): void {
     try {
       if (typeof sessionId !== "string" || typeof message !== "string") throw new Error("提交参数无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
-      if (!workspace || workspace.state === "discarded") throw new Error("任务 worktree 不可用。");
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
       const sha = await gitService.commit(workspace, message);
       projectStore.updateTaskWorkspaceState(sessionId, "committed");
+      protocol.registerTaskWorkspace(sessionId, workspace.repositoryPath, workspace.branch, "committed");
       return { ok: true, sha } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
@@ -461,6 +764,11 @@ function installIpc(): void {
       if (typeof sessionId !== "string") throw new Error("任务标识无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
       if (!workspace || workspace.state === "discarded") return { ok: true } as const;
+      if (workspace.state === "missing") {
+        projectStore.updateTaskWorkspaceState(sessionId, "discarded");
+        protocol.registerTaskWorkspace(sessionId, workspace.repositoryPath, workspace.branch, "discarded");
+        return { ok: true } as const;
+      }
       const review = await gitService.review(workspace);
       const detail = review.files.length > 0
         ? `将移除独立 worktree、分支 ${workspace.branch} 以及其中 ${review.files.length} 个变更文件。已提交对象通常仍可通过 Git reflog 恢复。`
@@ -469,6 +777,7 @@ function installIpc(): void {
       if (result.response !== 1) return { ok: false, error: "已取消丢弃操作。" } as const;
       await gitService.discard(workspace);
       projectStore.updateTaskWorkspaceState(sessionId, "discarded");
+      protocol.registerTaskWorkspace(sessionId, workspace.repositoryPath, workspace.branch, "discarded");
       return { ok: true } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
@@ -478,16 +787,18 @@ function installIpc(): void {
     try {
       if (typeof sessionId !== "string" || !["finder", "terminal", "editor"].includes(String(target))) throw new Error("打开参数无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
-      if (!workspace || workspace.state === "discarded") throw new Error("任务 worktree 不可用。");
-      if (target === "finder") await shell.openPath(workspace.worktreePath);
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
+      if (target === "finder") {
+        const failure = await shell.openPath(workspace.worktreePath);
+        if (failure) throw new Error(failure);
+      }
       else {
         const args = target === "terminal"
           ? ["-a", "Terminal", workspace.worktreePath]
           : settingsSnapshot().editor === "vscode"
             ? ["-a", "Visual Studio Code", workspace.worktreePath]
             : [workspace.worktreePath];
-        const child = spawn("/usr/bin/open", args, { detached: true, stdio: "ignore" });
-        child.unref();
+        await execFileAsync("/usr/bin/open", args);
       }
       return { ok: true } as const;
     } catch (error) {
@@ -525,7 +836,7 @@ function installIpc(): void {
       const baseURL = validateBaseURL(String(value.baseURL ?? ""));
       const apiKey = typeof value.apiKey === "string" && value.apiKey.trim() ? value.apiKey.trim() : readStoredSecret();
       if (!apiKey) throw new Error("请先输入 DeepSeek API Key。");
-      const models = await protocol.discoverModels(baseURL, apiKey);
+      const models = await testModelConnection(baseURL, apiKey);
       return { ok: true, models } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
@@ -541,7 +852,7 @@ function installIpc(): void {
         runtime: { ...publicSnapshot(), url: undefined, logs: publicSnapshot().logs.slice(-100) },
         protocol: { phase: protocol.snapshot.phase, generation: protocol.snapshot.generation, taskCount: protocol.snapshot.tasks.length, pendingApprovals: protocol.snapshot.approvals.length, pendingQuestions: protocol.snapshot.questions.length, error: protocol.snapshot.error },
         projects: projectStore.list().map((project) => ({ id: project.id, name: project.name, active: project.active })),
-        settings: { ...settingsSnapshot(), credentialConfigured: settingsSnapshot().credentialConfigured },
+        settings: safeSettingsDiagnostics(settingsSnapshot()),
       };
       await writeFile(result.filePath, `${JSON.stringify(diagnostics, null, 2)}\n`, { mode: 0o600 });
       return { ok: true, path: result.filePath } as const;
@@ -559,12 +870,15 @@ function installMenu(): void {
         submenu: [
           { role: "about" },
           { type: "separator" },
+          { label: "设置…", accelerator: "CmdOrCtrl+,", click: () => mainWindow?.webContents.send("settings:open-requested") },
+          { type: "separator" },
           { role: "hide" },
           { role: "hideOthers" },
           { type: "separator" },
           { role: "quit" },
         ],
       },
+      { role: "editMenu" },
       {
         label: "项目",
         submenu: [
@@ -590,18 +904,54 @@ function installMenu(): void {
   );
 }
 
+function deliverNotifications(): void {
+  if (!Notification.isSupported() || mainWindow?.isFocused()) return;
+  for (const [id, item] of currentNotifications) {
+    if (notifiedRequests.has(id)) continue;
+    notifiedRequests.add(id);
+    const notification = new Notification({ title: item.title, body: item.body, silent: false });
+    notification.on("click", () => {
+      mainWindow?.show();
+      mainWindow?.focus();
+      mainWindow?.webContents.send("inbox:focus");
+    });
+    notification.show();
+  }
+}
+
+function syncNotifications(snapshot: ProtocolSnapshot): void {
+  const actionable = [
+    ...snapshot.approvals.map((approval) => ({ id: `approval:${approval.approvalId}`, title: "任务需要授权", body: approval.reason ?? `${approval.toolName} 请求执行受保护操作` })),
+    ...snapshot.questions.map((question) => ({ id: `question:${question.requestId}`, title: "任务等待你的回答", body: question.questions[0]?.question ?? "Harness 需要更多信息" })),
+    ...snapshot.tasks.filter((task) => task.readyForReview && ["active", "committed"].includes(task.workspaceState ?? "active") && task.worktreeBranch && !task.archived && !task.error).map((task) => ({ id: `review:${task.sessionId}`, title: "任务可以审阅", body: task.title })),
+  ];
+  const activeIds = new Set(actionable.map((item) => item.id));
+  for (const id of notifiedRequests) if (!activeIds.has(id)) notifiedRequests.delete(id);
+  currentNotifications.clear();
+  for (const item of actionable) currentNotifications.set(item.id, item);
+  deliverNotifications();
+}
+
 app.whenReady().then(async () => {
   console.log("Electron app is ready.");
   projectStore = new ProjectStore(join(app.getPath("userData"), "desktop.sqlite"));
   gitService = new GitService(join(app.getPath("userData"), "worktrees"));
+  gateway.setMarkdownOpenHandler(async (path) => {
+    if (!harnessWindow || harnessWindow.isDestroyed()) return false;
+    await openHarnessMarkdownPreview(path);
+    return true;
+  });
   for (const workspace of projectStore.listTaskWorkspaces()) {
-    if (workspace.state === "discarded") continue;
-    try {
-      await access(workspace.worktreePath);
-      protocol.registerTaskWorkspace(workspace.sessionId, workspace.repositoryPath, workspace.branch);
-    } catch {
-      projectStore.updateTaskWorkspaceState(workspace.sessionId, "missing");
+    let state = workspace.state;
+    if (state !== "discarded") {
+      try {
+        await access(workspace.worktreePath);
+      } catch {
+        state = "missing";
+        projectStore.updateTaskWorkspaceState(workspace.sessionId, state);
+      }
     }
+    protocol.registerTaskWorkspace(workspace.sessionId, workspace.repositoryPath, workspace.branch, state);
   }
   const activeProject = projectStore.list().find((project) => project.active);
   sidecar = new HarnessSidecar({
@@ -629,23 +979,7 @@ app.whenReady().then(async () => {
       appliedModelGeneration = snapshot.generation;
       void protocol.updateDefaultModel(settingsSnapshot().model).catch((error: unknown) => console.error("Default model setting failed.", error));
     }
-    const actionable = [
-      ...snapshot.approvals.map((approval) => ({ id: `approval:${approval.approvalId}`, title: "任务需要授权", body: approval.reason ?? `${approval.toolName} 请求执行受保护操作` })),
-      ...snapshot.questions.map((question) => ({ id: `question:${question.requestId}`, title: "任务等待你的回答", body: question.questions[0]?.question ?? "Harness 需要更多信息" })),
-      ...snapshot.tasks.filter((task) => task.readyForReview && task.worktreeBranch && !task.archived && !task.error).map((task) => ({ id: `review:${task.sessionId}`, title: "任务可以审阅", body: task.title })),
-    ];
-    for (const item of actionable) {
-      if (notifiedRequests.has(item.id)) continue;
-      notifiedRequests.add(item.id);
-      if (!Notification.isSupported() || mainWindow?.isFocused()) continue;
-      const notification = new Notification({ title: item.title, body: item.body, silent: false });
-      notification.on("click", () => {
-        mainWindow?.show();
-        mainWindow?.focus();
-        mainWindow?.webContents.send("inbox:focus");
-      });
-      notification.show();
-    }
+    syncNotifications(snapshot);
   });
   protocol.on("timeline", (snapshot) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("tasks:timeline-changed", snapshot);
@@ -653,12 +987,13 @@ app.whenReady().then(async () => {
   installIpc();
   installMenu();
   await createMainWindow();
+  mainWindow?.on("blur", deliverNotifications);
   void sidecar.start().catch((error: unknown) => {
     console.error("Harness failed before process start.", error);
   });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) void createMainWindow();
+    void createMainWindow();
   });
 }).catch((error: unknown) => {
   console.error("DSH Desktop startup failed.", error);

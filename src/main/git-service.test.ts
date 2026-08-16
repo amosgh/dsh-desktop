@@ -31,9 +31,14 @@ describe("GitService", () => {
     expect(workspace.worktreePath).toContain("11111111-1111-4111-8111-111111111111");
     await writeFile(join(workspace.worktreePath, "hello.txt"), "hello world\n");
     await writeFile(join(workspace.worktreePath, "new.txt"), "new\n");
+    await writeFile(join(workspace.worktreePath, "README.md"), "# Preview\n\n[Docs](https://example.com)\n");
     const review = await service.review(workspace);
-    expect(review.files.map((file) => file.path)).toEqual(["hello.txt", "new.txt"]);
+    expect(review.files.map((file) => file.path)).toEqual(["hello.txt", "new.txt", "README.md"]);
     expect(await service.diff(workspace, "hello.txt")).toContain("hello world");
+    await expect(service.preview(workspace, "README.md")).resolves.toMatchObject({ kind: "markdown", content: expect.stringContaining("# Preview") });
+    await expect(service.preview(workspace, join(workspace.worktreePath, "README.md"))).resolves.toMatchObject({ path: "README.md", kind: "markdown" });
+    await expect(service.preview(workspace, join(root, "outside.md"))).rejects.toThrow("超出");
+    await expect(service.preview(workspace, "hello.txt")).rejects.toThrow("Markdown");
     expect(await service.commit(workspace, "finish task")).toMatch(/^[0-9a-f]{40}$/);
     await service.discard(workspace);
     await expect(execFileAsync("git", ["show-ref", "--verify", `refs/heads/${workspace.branch}`], { cwd: repository })).rejects.toBeTruthy();

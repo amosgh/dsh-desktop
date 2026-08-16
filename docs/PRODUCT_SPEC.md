@@ -18,7 +18,7 @@ A developer can install the app, configure a model, open a repository, delegate 
 ### Required for MVP
 
 - First-run setup and runtime health check.
-- DeepSeek API key plus configurable OpenAI-compatible endpoint.
+- DeepSeek API key plus a configurable gateway compatible with DeepSeek's OpenAI-style chat, streaming, reasoning, and tool-call behavior.
 - Add, remove, rename, and reopen local projects.
 - Create, resume, stop, retry, archive, and fork sessions.
 - Stream messages, plans, tool calls, terminal activity, and errors.

@@ -2,11 +2,13 @@
 
 ## Local acceptance
 
-1. Install from the lockfile with `npm ci` on Apple Silicon macOS.
-2. Run `npm run verify` and `npm run dist:mac`.
-3. Launch `release/mac-arm64/DSH Desktop.app` from a clean test user.
-4. Verify first-run credential setup, project grant, task creation, approval/question resolution, crash recovery, review/commit, confirmed discard, relaunch recovery, dark mode, reduced motion, and keyboard-only navigation.
-5. Export diagnostics and confirm it contains no synthetic API key, endpoint URL, absolute project path, prompt, or diff.
+1. Use macOS 14+ on Apple Silicon with native arm64 Node.js 24+, Git, and the Xcode Command Line Tools. Confirm both `uname -m` and `node -p "process.arch"` report `arm64`.
+2. Install from the lockfile with `npm ci`.
+3. Run `npm run verify` and `npm run dist:mac`.
+4. Confirm the packaged `Info.plist` declares macOS 14.0 or later, Electron is arm64, and the bundled Node executable contains an arm64 slice.
+5. Launch `release/mac-arm64/DSH Desktop.app` from a clean test user.
+6. Verify first-run credential setup, project grant, failed-task worktree rollback, approval/question resolution, crash recovery, relaunch visibility for discarded/missing task workspaces, review/commit, confirmed discard, Markdown preview, internal HTTP/HTTPS browsing, dark mode, reduced motion, and keyboard-only navigation.
+7. Export diagnostics and confirm it contains no synthetic API key, endpoint URL, absolute project path, prompt, or diff.
 
 ## Signed public artifact
 

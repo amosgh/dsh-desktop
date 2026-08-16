@@ -8,7 +8,7 @@ product
 
 DSH Desktop serves developers who want to run DeepSeek Harness against real local repositories without living in a terminal. They may work alone or supervise several coding tasks in parallel. Their primary job is to start an agent task, understand what it is doing, intervene safely, and review the resulting code without losing the state of their main checkout.
 
-The first release is macOS-first, Simplified-Chinese-first, and designed for bring-your-own-key users of the DeepSeek API or another OpenAI-compatible endpoint.
+The first release is macOS-first, Simplified-Chinese-first, and designed for bring-your-own-key users of the DeepSeek API or a gateway compatible with DeepSeek's OpenAI-style wire behavior.
 
 ## Product Purpose
 

@@ -84,11 +84,33 @@ export interface DesktopTaskSummary {
   cwd?: string | undefined;
   projectPath?: string | undefined;
   worktreeBranch?: string | undefined;
+  workspaceState?: TaskWorkspaceRecord["state"] | undefined;
   lastSeq?: number | undefined;
   pendingApprovals: number;
   archived: boolean;
   readyForReview: boolean;
   error?: string | undefined;
+}
+
+export interface FilePreview {
+  path: string;
+  kind: "markdown";
+  content: string;
+}
+
+export interface BrowserViewBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrowserNavigationSnapshot {
+  url: string;
+  title: string;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  loading: boolean;
 }
 
 export interface PendingApproval {
@@ -188,9 +210,16 @@ export interface DesktopApi {
   archiveTask(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }>;
   getTaskReview(sessionId: string): Promise<GitReviewSnapshot>;
   getTaskFileDiff(sessionId: string, path: string): Promise<{ ok: true; diff: string } | { ok: false; error: string }>;
+  getTaskFilePreview(sessionId: string, path: string): Promise<{ ok: true; preview: FilePreview } | { ok: false; error: string }>;
   commitTask(sessionId: string, message: string): Promise<{ ok: true; sha: string } | { ok: false; error: string }>;
   discardTaskWorkspace(sessionId: string): Promise<{ ok: true } | { ok: false; error: string }>;
   openTaskWorkspace(sessionId: string, target: "finder" | "terminal" | "editor"): Promise<{ ok: true } | { ok: false; error: string }>;
+  openWebAddress(url: string, bounds: BrowserViewBounds): Promise<{ ok: true } | { ok: false; error: string }>;
+  setBrowserViewBounds(bounds: BrowserViewBounds): Promise<{ ok: true } | { ok: false; error: string }>;
+  closeBrowserView(): Promise<void>;
+  navigateBrowserView(action: "back" | "forward" | "reload"): Promise<void>;
+  subscribeBrowserNavigation(listener: (snapshot: BrowserNavigationSnapshot) => void): () => void;
+  subscribeBrowserOpenRequest(listener: (url: string) => void): () => void;
   getSettings(): Promise<SettingsSnapshot>;
   saveSettings(input: { apiKey?: string; clearApiKey?: boolean; baseURL: string; model: string; editor: "vscode" | "system" }): Promise<{ ok: true; settings: SettingsSnapshot } | { ok: false; error: string }>;
   testModelConnection(input: { apiKey?: string; baseURL: string }): Promise<{ ok: true; models: string[] } | { ok: false; error: string }>;
@@ -203,4 +232,5 @@ export interface DesktopApi {
   subscribeProtocol(listener: (snapshot: ProtocolSnapshot) => void): () => void;
   subscribeNewTask(listener: () => void): () => void;
   subscribeInboxFocus(listener: () => void): () => void;
+  subscribeSettingsOpen(listener: () => void): () => void;
 }

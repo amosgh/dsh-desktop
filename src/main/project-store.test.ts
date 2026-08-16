@@ -30,6 +30,8 @@ describe("ProjectStore", () => {
     const reopened = new ProjectStore(databasePath);
     expect(reopened.list().find((project) => project.id === second.id)?.active).toBe(true);
     expect(reopened.listTaskWorkspaces(first.id)).toHaveLength(1);
+    expect(reopened.deleteTaskWorkspace("session-1")).toBe(true);
+    expect(reopened.getTaskWorkspace("session-1")).toBeUndefined();
     expect(reopened.remove(second.id)).toBe(true);
     expect(reopened.list()).toHaveLength(1);
     reopened.close();

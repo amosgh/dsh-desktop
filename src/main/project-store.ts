@@ -119,6 +119,10 @@ export class ProjectStore {
     this.#database.prepare("UPDATE task_workspaces SET state = ? WHERE session_id = ?").run(state, sessionId);
   }
 
+  deleteTaskWorkspace(sessionId: string): boolean {
+    return this.#database.prepare("DELETE FROM task_workspaces WHERE session_id = ?").run(sessionId).changes > 0;
+  }
+
   getPreference(key: string): string | undefined {
     return this.#getSetting(key);
   }
