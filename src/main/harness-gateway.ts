@@ -12,6 +12,7 @@ import type { Duplex } from "node:stream";
 
 const COOKIE_NAME = "dsh_desktop_session";
 const PROTOCOL_VERSION = "1" as const;
+const MAX_INTERCEPTED_BODY = 64 * 1024;
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -35,6 +36,11 @@ export class HarnessGateway {
   #upstream: URL | undefined;
   #session: GatewaySession | undefined;
   #sockets = new Set<Duplex>();
+  #markdownOpenHandler: ((path: string) => Promise<boolean>) | undefined;
+
+  setMarkdownOpenHandler(handler: ((path: string) => Promise<boolean>) | undefined): void {
+    this.#markdownOpenHandler = handler;
+  }
 
   get session(): GatewaySession | undefined {
     return this.#session ? { ...this.#session } : undefined;
@@ -127,6 +133,47 @@ export class HarnessGateway {
       response.end(JSON.stringify({ protocolVersion: PROTOCOL_VERSION, authenticated: true }));
       return;
     }
+    if (request.method === "POST" && request.url === "/api/host.openPath" && this.#markdownOpenHandler) {
+      void this.#handleOpenPathRequest(request, response);
+      return;
+    }
+
+    this.#proxyRequest(request, response);
+  }
+
+  async #handleOpenPathRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    try {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      for await (const chunk of request) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += bytes.byteLength;
+        if (size > MAX_INTERCEPTED_BODY) {
+          response.writeHead(413, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+          response.end("Request body too large");
+          return;
+        }
+        chunks.push(bytes);
+      }
+      const body = Buffer.concat(chunks);
+      let message: unknown;
+      try { message = JSON.parse(body.toString("utf8")); } catch { message = undefined; }
+      const envelope = message && typeof message === "object" ? message as { type?: unknown; rpcId?: unknown; method?: unknown; payload?: unknown } : undefined;
+      const payload = envelope?.payload && typeof envelope.payload === "object" ? envelope.payload as { path?: unknown } : undefined;
+      const path = typeof payload?.path === "string" ? payload.path : undefined;
+      if (envelope?.type === "client-request" && typeof envelope.rpcId === "string" && envelope.method === "host.openPath" && path && /\.md(?:own)?$/i.test(path) && await this.#markdownOpenHandler?.(path)) {
+        response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        response.end(JSON.stringify({ type: "server-response", rpcId: envelope.rpcId, result: { ok: true, value: { opened: true } } }));
+        return;
+      }
+      this.#proxyRequest(request, response, body);
+    } catch {
+      if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+      response.end("Harness request interception failed");
+    }
+  }
+
+  #proxyRequest(request: IncomingMessage, response: ServerResponse, body?: Buffer): void {
 
     const upstream = this.#upstream;
     if (!upstream) {
@@ -149,7 +196,8 @@ export class HarnessGateway {
       if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
       response.end("Harness upstream unavailable");
     });
-    request.pipe(proxyRequest);
+    if (body) proxyRequest.end(body);
+    else request.pipe(proxyRequest);
   }
 
   #handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {

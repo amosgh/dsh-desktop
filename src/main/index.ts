@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { access, writeFile } from "node:fs/promises";
@@ -26,11 +26,15 @@ import { GitService } from "./git-service.js";
 import { testModelConnection } from "./model-connection.js";
 import { safeSettingsDiagnostics } from "./diagnostics.js";
 import { parseWebAddress } from "./browser-policy.js";
+import { htmlDataURL, markdownDocument, previewChromeDocument, previewStateDocument, readHarnessMarkdown } from "./harness-preview.js";
 
 let mainWindow: BrowserWindow | undefined;
 let harnessWindow: BrowserWindow | undefined;
 let browserView: WebContentsView | undefined;
-let browserSessionConfigured = false;
+let harnessPreviewChrome: WebContentsView | undefined;
+let harnessPreviewContent: WebContentsView | undefined;
+let harnessPreviewMode: "markdown" | "web" | undefined;
+const configuredBrowserSessions = new Set<string>();
 let sidecar: HarnessSidecar;
 let projectStore: ProjectStore;
 let gitService: GitService;
@@ -120,6 +124,7 @@ function broadcast(snapshot: SidecarSnapshot): void {
 }
 
 function closeHarnessWindow(): void {
+  closeHarnessPreview();
   if (harnessWindow && !harnessWindow.isDestroyed()) harnessWindow.close();
   harnessWindow = undefined;
 }
@@ -260,10 +265,10 @@ function ensureBrowserView(): WebContentsView {
     },
   });
   mainWindow.contentView.addChildView(browserView);
-  if (!browserSessionConfigured) {
+  if (!configuredBrowserSessions.has("main-browser")) {
     browserView.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
     browserView.webContents.session.on("will-download", (event) => event.preventDefault());
-    browserSessionConfigured = true;
+    configuredBrowserSessions.add("main-browser");
   }
   browserView.webContents.setWindowOpenHandler(({ url: target }) => {
     try { void browserView?.webContents.loadURL(parseWebAddress(target).toString()); } catch { /* Unsupported targets remain denied. */ }
@@ -280,6 +285,124 @@ function ensureBrowserView(): WebContentsView {
   browserView.webContents.on("did-navigate-in-page", broadcastBrowserNavigation);
   browserView.webContents.on("page-title-updated", broadcastBrowserNavigation);
   return browserView;
+}
+
+function harnessPreviewWidth(): number {
+  const width = harnessWindow?.getContentBounds().width ?? 1280;
+  return Math.max(380, Math.min(620, Math.round(width * 0.42)));
+}
+
+function updateHarnessPreviewLayout(): void {
+  if (!harnessWindow || harnessWindow.isDestroyed() || !harnessPreviewChrome || !harnessPreviewContent) return;
+  const bounds = harnessWindow.getContentBounds();
+  const width = harnessPreviewWidth();
+  const x = Math.max(0, bounds.width - width);
+  harnessPreviewChrome.setBounds({ x, y: 0, width, height: 52 });
+  harnessPreviewContent.setBounds({ x, y: 52, width, height: Math.max(1, bounds.height - 52) });
+  void harnessWindow.webContents.executeJavaScript(`(() => { let style = document.getElementById("dsh-desktop-preview-layout"); if (!style) { style = document.createElement("style"); style.id = "dsh-desktop-preview-layout"; document.head.append(style); } style.textContent = ${JSON.stringify(`#root { width: calc(100vw - ${width}px) !important; max-width: calc(100vw - ${width}px) !important; overflow-x: hidden !important; }`)}; })()`);
+}
+
+function closeHarnessPreview(): void {
+  if (harnessWindow && !harnessWindow.isDestroyed()) {
+    if (harnessPreviewChrome) harnessWindow.contentView.removeChildView(harnessPreviewChrome);
+    if (harnessPreviewContent) harnessWindow.contentView.removeChildView(harnessPreviewContent);
+    void harnessWindow.webContents.executeJavaScript('document.getElementById("dsh-desktop-preview-layout")?.remove()');
+  }
+  if (harnessPreviewChrome && !harnessPreviewChrome.webContents.isDestroyed()) harnessPreviewChrome.webContents.close();
+  if (harnessPreviewContent && !harnessPreviewContent.webContents.isDestroyed()) harnessPreviewContent.webContents.close();
+  harnessPreviewChrome = undefined;
+  harnessPreviewContent = undefined;
+  harnessPreviewMode = undefined;
+}
+
+function handleHarnessPreviewTarget(target: string): boolean {
+  let url: URL;
+  try { url = new URL(target); } catch { return false; }
+  if (url.protocol !== "dsh-preview:") return false;
+  const action = url.hostname;
+  if (action === "close") closeHarnessPreview();
+  else if (action === "file") {
+    const path = url.searchParams.get("path");
+    if (path) void openHarnessMarkdownPreview(path);
+  } else if (action === "web") {
+    const value = url.searchParams.get("url");
+    if (value) void openHarnessWebPreview(value);
+  } else if (action === "back" && harnessPreviewContent?.webContents.navigationHistory.canGoBack()) harnessPreviewContent.webContents.navigationHistory.goBack();
+  else if (action === "forward" && harnessPreviewContent?.webContents.navigationHistory.canGoForward()) harnessPreviewContent.webContents.navigationHistory.goForward();
+  else if (action === "reload") harnessPreviewContent?.webContents.reload();
+  return true;
+}
+
+function ensureHarnessPreviewViews(): { chrome: WebContentsView; content: WebContentsView } {
+  if (!harnessWindow || harnessWindow.isDestroyed()) throw new Error("Harness 窗口尚未打开。");
+  if (harnessPreviewChrome && harnessPreviewContent && !harnessPreviewChrome.webContents.isDestroyed() && !harnessPreviewContent.webContents.isDestroyed()) return { chrome: harnessPreviewChrome, content: harnessPreviewContent };
+  const preferences = { contextIsolation: true, nodeIntegration: false, sandbox: true, webSecurity: true, allowRunningInsecureContent: false, partition: "dsh-harness-preview-session" } as const;
+  harnessPreviewChrome = new WebContentsView({ webPreferences: preferences });
+  harnessPreviewContent = new WebContentsView({ webPreferences: preferences });
+  harnessWindow.contentView.addChildView(harnessPreviewChrome);
+  harnessWindow.contentView.addChildView(harnessPreviewContent);
+  if (!configuredBrowserSessions.has("harness-preview")) {
+    harnessPreviewContent.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+    harnessPreviewContent.webContents.session.on("will-download", (event) => event.preventDefault());
+    configuredBrowserSessions.add("harness-preview");
+  }
+  for (const view of [harnessPreviewChrome, harnessPreviewContent]) {
+    view.webContents.setWindowOpenHandler(({ url }) => {
+      if (!handleHarnessPreviewTarget(url) && view === harnessPreviewContent && harnessPreviewMode === "web") {
+        try { void view.webContents.loadURL(parseWebAddress(url).toString()); } catch { /* Unsupported targets remain denied. */ }
+      }
+      return { action: "deny" };
+    });
+    view.webContents.on("will-navigate", (event, target) => {
+      if (handleHarnessPreviewTarget(target)) { event.preventDefault(); return; }
+      if (view === harnessPreviewContent && harnessPreviewMode === "web") {
+        try { parseWebAddress(target); return; } catch { /* Denied below. */ }
+      }
+      if (!target.startsWith("data:text/html")) event.preventDefault();
+    });
+  }
+  updateHarnessPreviewLayout();
+  return { chrome: harnessPreviewChrome, content: harnessPreviewContent };
+}
+
+function harnessPreviewRoots(): string[] {
+  return [...new Set([
+    ...projectStore.list().map((project) => project.path),
+    ...projectStore.listTaskWorkspaces().flatMap((workspace) => [workspace.worktreePath, workspace.repositoryPath]),
+    ...protocol.snapshot.tasks.flatMap((task) => [task.cwd, task.projectPath].filter((path): path is string => Boolean(path))),
+  ])];
+}
+
+async function openHarnessMarkdownPreview(path: string): Promise<void> {
+  if (!harnessWindow || harnessWindow.isDestroyed()) throw new Error("Harness 窗口尚未打开。");
+  const { chrome, content } = ensureHarnessPreviewViews();
+  harnessPreviewMode = "markdown";
+  const dark = nativeTheme.shouldUseDarkColors;
+  try {
+    const preview = await readHarnessMarkdown(path, harnessPreviewRoots());
+    await Promise.all([
+      chrome.webContents.loadURL(htmlDataURL(previewChromeDocument(basename(preview.path), preview.path, dark))),
+      content.webContents.loadURL(htmlDataURL(markdownDocument(preview, dark))),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await Promise.all([
+      chrome.webContents.loadURL(htmlDataURL(previewChromeDocument(basename(path), path, dark))),
+      content.webContents.loadURL(htmlDataURL(previewStateDocument("无法打开 Markdown", message, dark))),
+    ]);
+  }
+  updateHarnessPreviewLayout();
+  harnessWindow.show();
+  harnessWindow.focus();
+}
+
+async function openHarnessWebPreview(value: string): Promise<void> {
+  const url = parseWebAddress(value);
+  const { chrome, content } = ensureHarnessPreviewViews();
+  harnessPreviewMode = "web";
+  await chrome.webContents.loadURL(htmlDataURL(previewChromeDocument(url.hostname, url.toString(), nativeTheme.shouldUseDarkColors, true)));
+  await content.webContents.loadURL(url.toString());
+  updateHarnessPreviewLayout();
 }
 
 async function openWebAddress(value: string, rawBounds: unknown): Promise<{ ok: true } | { ok: false; error: string }> {
@@ -388,8 +511,10 @@ async function openHarnessWindow(): Promise<{ ok: true } | { ok: false; error: s
     console.log(`Harness workspace loaded through authenticated adapter ${gatewaySession.endpoint}`);
   });
   harnessWindow.once("closed", () => {
+    closeHarnessPreview();
     harnessWindow = undefined;
   });
+  harnessWindow.on("resize", updateHarnessPreviewLayout);
   await harnessWindow.loadURL(gatewaySession.endpoint);
   return { ok: true };
 }
@@ -811,6 +936,11 @@ app.whenReady().then(async () => {
   console.log("Electron app is ready.");
   projectStore = new ProjectStore(join(app.getPath("userData"), "desktop.sqlite"));
   gitService = new GitService(join(app.getPath("userData"), "worktrees"));
+  gateway.setMarkdownOpenHandler(async (path) => {
+    if (!harnessWindow || harnessWindow.isDestroyed()) return false;
+    await openHarnessMarkdownPreview(path);
+    return true;
+  });
   for (const workspace of projectStore.listTaskWorkspaces()) {
     let state = workspace.state;
     if (state !== "discarded") {

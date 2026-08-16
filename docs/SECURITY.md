@@ -12,7 +12,7 @@ Do not open a public issue for a suspected vulnerability that exposes credential
 - Harness runs as a supervised child process on an ephemeral loopback port. The embedded upstream UI is exposed only through a desktop-owned gateway with a 256-bit ephemeral capability in an HttpOnly cookie.
 - Every task created by the desktop receives a pinned Git worktree. Repository mutations are serialized per repository; worktree removal is limited to generated paths and requires confirmation.
 - Diagnostics exclude API keys, gateway credentials, raw endpoint URLs, and absolute repository paths; the exported file is created with mode `0600`.
-- The right-side Markdown preview reads only `.md`/`.markdown` files contained by a desktop-managed task worktree, caps content at 1 MB, and never renders raw HTML. Absolute and `file://` report links are resolved and containment-checked in Main. The adjacent browser view accepts only credential-free HTTP/HTTPS URLs, runs without Node integration, and denies permissions and downloads.
+- The right-side Markdown preview reads only `.md`/`.markdown` files contained by a desktop-managed task worktree, an authorized project, or a cwd reported by an active Harness session; it caps content at 1 MB and never renders raw HTML. Authenticated Harness `host.openPath` calls are intercepted only for Markdown, while all other file types retain the upstream native-open behavior. Absolute, relative, `file://`, and symlink-resolved report paths are containment-checked in Main. The adjacent browser view accepts only credential-free HTTP/HTTPS URLs, runs without Node integration, and denies permissions and downloads.
 
 ## Residual risks
 

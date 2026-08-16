@@ -52,4 +52,34 @@ describe("HarnessGateway", () => {
     gateways.push(gateway);
     await expect(gateway.start("https://example.com")).rejects.toThrow("non-loopback");
   });
+
+  it("intercepts authenticated Markdown open requests and preserves other paths", async () => {
+    let upstreamCalls = 0;
+    const upstream = createServer((_request, response) => {
+      upstreamCalls += 1;
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ type: "server-response", rpcId: "upstream", result: { ok: true, value: { opened: true } } }));
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const gateway = new HarnessGateway();
+    gateways.push(gateway);
+    const opened: string[] = [];
+    gateway.setMarkdownOpenHandler(async (path) => { opened.push(path); return true; });
+    try {
+      const address = upstream.address() as AddressInfo;
+      const session = await gateway.start(`http://127.0.0.1:${address.port}`);
+      const headers = { cookie: `${session.cookieName}=${session.token}`, "content-type": "application/json" };
+      const markdown = await fetch(`${session.endpoint}/api/host.openPath`, { method: "POST", headers, body: JSON.stringify({ type: "client-request", rpcId: "md-1", method: "host.openPath", payload: { path: "/workspace/report.md" } }) });
+      expect(await markdown.json()).toEqual({ type: "server-response", rpcId: "md-1", result: { ok: true, value: { opened: true } } });
+      expect(opened).toEqual(["/workspace/report.md"]);
+      expect(upstreamCalls).toBe(0);
+
+      await fetch(`${session.endpoint}/api/host.openPath`, { method: "POST", headers, body: JSON.stringify({ type: "client-request", rpcId: "txt-1", method: "host.openPath", payload: { path: "/workspace/report.txt" } }) });
+      expect(upstreamCalls).toBe(1);
+    } finally {
+      await gateway.stop();
+      upstream.closeAllConnections();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
+  });
 });
