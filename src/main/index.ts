@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { access, writeFile } from "node:fs/promises";
+import { promisify } from "node:util";
 import {
   app,
   BrowserWindow,
@@ -16,15 +17,19 @@ import {
 } from "electron";
 import { HarnessSidecar } from "./harness-sidecar.js";
 import { HarnessGateway } from "./harness-gateway.js";
-import type { AdapterSnapshot, ProtocolSnapshot, SettingsSnapshot, SidecarSnapshot } from "../shared/contracts.js";
+import type { AdapterSnapshot, ProtocolSnapshot, SettingsSnapshot, SidecarSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
 import { ProjectStore } from "./project-store.js";
 import { assertProjectId, inspectProject } from "./project-inspector.js";
 import { HarnessProtocolClient } from "./harness-protocol-client.js";
 import { GitService } from "./git-service.js";
 import { testModelConnection } from "./model-connection.js";
+import { safeSettingsDiagnostics } from "./diagnostics.js";
+import { parseWebAddress } from "./browser-policy.js";
 
 let mainWindow: BrowserWindow | undefined;
 let harnessWindow: BrowserWindow | undefined;
+let browserWindow: BrowserWindow | undefined;
+let browserSessionConfigured = false;
 let sidecar: HarnessSidecar;
 let projectStore: ProjectStore;
 let gitService: GitService;
@@ -33,8 +38,12 @@ const gateway = new HarnessGateway();
 const protocol = new HarnessProtocolClient();
 let gatewayUpstream: string | undefined;
 let gatewayEpoch = 0;
+let gatewayRetryAttempt = 0;
+let gatewayRetryTimer: NodeJS.Timeout | undefined;
 const notifiedRequests = new Set<string>();
+const currentNotifications = new Map<string, { title: string; body: string }>();
 let appliedModelGeneration = 0;
+const execFileAsync = promisify(execFile);
 let adapter: AdapterSnapshot = {
   phase: "locked",
   protocolVersion: "1",
@@ -114,8 +123,27 @@ function closeHarnessWindow(): void {
   harnessWindow = undefined;
 }
 
+function clearGatewayRetry(): void {
+  if (gatewayRetryTimer) clearTimeout(gatewayRetryTimer);
+  gatewayRetryTimer = undefined;
+}
+
+function scheduleGatewayRetry(snapshot: SidecarSnapshot): void {
+  if (gatewayRetryTimer || gatewayRetryAttempt >= 5 || snapshot.phase !== "ready" || !snapshot.url) return;
+  gatewayRetryAttempt += 1;
+  const expectedUrl = snapshot.url;
+  const delay = Math.min(8_000, 500 * 2 ** (gatewayRetryAttempt - 1));
+  gatewayRetryTimer = setTimeout(() => {
+    gatewayRetryTimer = undefined;
+    if (sidecar.snapshot.phase === "ready" && sidecar.snapshot.url === expectedUrl) void reconcileGateway(sidecar.snapshot);
+  }, delay);
+  gatewayRetryTimer.unref();
+}
+
 async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
   if (snapshot.phase !== "ready" || !snapshot.url) {
+    clearGatewayRetry();
+    gatewayRetryAttempt = 0;
     const epoch = ++gatewayEpoch;
     gatewayUpstream = undefined;
     adapter = { phase: "locked", protocolVersion: "1", authenticated: false };
@@ -126,12 +154,16 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
     broadcast(snapshot);
     return;
   }
-  if (gatewayUpstream === snapshot.url && ["starting", "ready"].includes(adapter.phase)) {
+  if (gatewayUpstream === snapshot.url && (["starting", "ready"].includes(adapter.phase) || (adapter.phase === "error" && (Boolean(gatewayRetryTimer) || gatewayRetryAttempt >= 5)))) {
     broadcast(snapshot);
     return;
   }
 
   const epoch = ++gatewayEpoch;
+  if (gatewayUpstream !== snapshot.url) {
+    clearGatewayRetry();
+    gatewayRetryAttempt = 0;
+  }
   gatewayUpstream = snapshot.url;
   protocol.connect(snapshot.url);
   adapter = { phase: "starting", protocolVersion: "1", authenticated: false };
@@ -145,6 +177,8 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
       authenticated: true,
       endpoint: session.endpoint,
     };
+    clearGatewayRetry();
+    gatewayRetryAttempt = 0;
   } catch (error) {
     if (epoch !== gatewayEpoch) return;
     adapter = {
@@ -153,19 +187,83 @@ async function reconcileGateway(snapshot: SidecarSnapshot): Promise<void> {
       authenticated: false,
       error: error instanceof Error ? error.message : String(error),
     };
+    scheduleGatewayRetry(snapshot);
   }
   broadcast(snapshot);
 }
 
 function installNavigationGuards(window: BrowserWindow, allowedOrigin?: string): void {
   window.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("https://")) void shell.openExternal(url);
+    if (/^https?:\/\//i.test(url)) void openWebAddress(url);
     return { action: "deny" };
   });
   window.webContents.on("will-navigate", (event, target) => {
-    if (allowedOrigin && new URL(target).origin === allowedOrigin) return;
+    try {
+      if (allowedOrigin && new URL(target).origin === allowedOrigin) return;
+    } catch {
+      // Malformed navigation targets are denied below.
+    }
     event.preventDefault();
   });
+}
+
+async function openWebAddress(value: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const url = parseWebAddress(value);
+    if (!browserWindow || browserWindow.isDestroyed()) {
+      browserWindow = new BrowserWindow({
+        width: 1100,
+        height: 760,
+        minWidth: 720,
+        minHeight: 520,
+        title: "DSH 内置浏览器",
+        backgroundColor: nativeTheme.shouldUseDarkColors ? "#17171a" : "#ffffff",
+        webPreferences: {
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          webSecurity: true,
+          allowRunningInsecureContent: false,
+          partition: "dsh-browser-session",
+        },
+      });
+      if (!browserSessionConfigured) {
+        browserWindow.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+        browserWindow.webContents.session.on("will-download", (event) => event.preventDefault());
+        browserSessionConfigured = true;
+      }
+      browserWindow.webContents.setWindowOpenHandler(({ url: target }) => {
+        try {
+          void browserWindow?.loadURL(parseWebAddress(target).toString());
+        } catch {
+          // Unsupported targets remain denied.
+        }
+        return { action: "deny" };
+      });
+      const guard = (event: Electron.Event, target: string) => {
+        try {
+          parseWebAddress(target);
+        } catch {
+          event.preventDefault();
+        }
+      };
+      browserWindow.webContents.on("will-navigate", guard);
+      browserWindow.webContents.on("will-redirect", guard);
+      browserWindow.webContents.on("before-input-event", (event, input) => {
+        if (!input.meta || input.type !== "keyDown") return;
+        if (input.key === "[" && browserWindow?.webContents.canGoBack()) { event.preventDefault(); browserWindow.webContents.goBack(); }
+        if (input.key === "]" && browserWindow?.webContents.canGoForward()) { event.preventDefault(); browserWindow.webContents.goForward(); }
+        if (input.key.toLowerCase() === "r") { event.preventDefault(); browserWindow?.webContents.reload(); }
+      });
+      browserWindow.on("closed", () => { browserWindow = undefined; });
+    }
+    await browserWindow.loadURL(url.toString());
+    browserWindow.show();
+    browserWindow.focus();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 async function createMainWindow(): Promise<void> {
@@ -272,6 +370,10 @@ function installIpc(): void {
   ipcMain.handle("sidecar:stop", () => sidecar.stop());
   ipcMain.handle("sidecar:restart", () => sidecar.restart());
   ipcMain.handle("harness:open", () => openHarnessWindow());
+  ipcMain.handle("browser:open", (_event, url: unknown) => {
+    if (typeof url !== "string") return { ok: false, error: "网址无效。" } as const;
+    return openWebAddress(url);
+  });
   ipcMain.handle("projects:list", () => projectStore.list());
   ipcMain.handle("projects:choose", async () => {
     const options: OpenDialogOptions = {
@@ -350,18 +452,30 @@ function installIpc(): void {
   ipcMain.handle("protocol:get", () => protocol.snapshot);
   ipcMain.handle("protocol:refresh", () => protocol.refresh());
   ipcMain.handle("tasks:create", async (_event, prompt: unknown) => {
+    let workspace: TaskWorkspaceRecord | undefined;
     try {
       if (typeof prompt !== "string") throw new Error("任务内容无效。");
       const activeProject = projectStore.list().find((project) => project.active);
       if (!activeProject) throw new Error("请先添加并选择一个项目。");
       const sessionId = randomUUID();
-      const workspace = await gitService.createWorktree(activeProject.id, activeProject.path, sessionId);
+      workspace = await gitService.createWorktree(activeProject.id, activeProject.path, sessionId);
       projectStore.saveTaskWorkspace(workspace);
-      protocol.registerTaskWorkspace(sessionId, activeProject.path, workspace.branch);
+      protocol.registerTaskWorkspace(sessionId, activeProject.path, workspace.branch, workspace.state);
       await protocol.createTask(workspace.worktreePath, prompt, sessionId);
       return { ok: true, sessionId } as const;
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!workspace) return { ok: false, error: message } as const;
+      protocol.unregisterTaskWorkspace(workspace.sessionId);
+      try {
+        await gitService.rollbackWorktree(workspace);
+        projectStore.deleteTaskWorkspace(workspace.sessionId);
+        return { ok: false, error: message } as const;
+      } catch (cleanupError) {
+        projectStore.updateTaskWorkspaceState(workspace.sessionId, "missing");
+        const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        return { ok: false, error: `${message}；自动清理 worktree 失败：${cleanupMessage}` } as const;
+      }
     }
   });
   ipcMain.handle("tasks:cancel", async (_event, sessionId: unknown) => {
@@ -442,15 +556,25 @@ function installIpc(): void {
   ipcMain.handle("review:get", async (_event, sessionId: unknown) => {
     if (typeof sessionId !== "string") throw new Error("任务标识无效。");
     const workspace = projectStore.getTaskWorkspace(sessionId);
-    if (!workspace || workspace.state === "discarded") return { sessionId, phase: "unavailable", files: [], additions: 0, deletions: 0, clean: true } as const;
+    if (!workspace || workspace.state === "discarded" || workspace.state === "missing") return { sessionId, phase: "unavailable", files: [], additions: 0, deletions: 0, clean: true, error: workspace?.state === "missing" ? "任务 worktree 已丢失或被外部移除。" : undefined } as const;
     return gitService.review(workspace);
   });
   ipcMain.handle("review:diff", async (_event, sessionId: unknown, path: unknown) => {
     try {
       if (typeof sessionId !== "string" || typeof path !== "string") throw new Error("差异参数无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
-      if (!workspace || workspace.state === "discarded") throw new Error("任务 worktree 不可用。");
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
       return { ok: true, diff: await gitService.diff(workspace, path) } as const;
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
+    }
+  });
+  ipcMain.handle("review:preview", async (_event, sessionId: unknown, path: unknown) => {
+    try {
+      if (typeof sessionId !== "string" || typeof path !== "string") throw new Error("预览参数无效。");
+      const workspace = projectStore.getTaskWorkspace(sessionId);
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
+      return { ok: true, preview: await gitService.preview(workspace, path) } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
     }
@@ -459,9 +583,10 @@ function installIpc(): void {
     try {
       if (typeof sessionId !== "string" || typeof message !== "string") throw new Error("提交参数无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
-      if (!workspace || workspace.state === "discarded") throw new Error("任务 worktree 不可用。");
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
       const sha = await gitService.commit(workspace, message);
       projectStore.updateTaskWorkspaceState(sessionId, "committed");
+      protocol.registerTaskWorkspace(sessionId, workspace.repositoryPath, workspace.branch, "committed");
       return { ok: true, sha } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
@@ -472,6 +597,11 @@ function installIpc(): void {
       if (typeof sessionId !== "string") throw new Error("任务标识无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
       if (!workspace || workspace.state === "discarded") return { ok: true } as const;
+      if (workspace.state === "missing") {
+        projectStore.updateTaskWorkspaceState(sessionId, "discarded");
+        protocol.registerTaskWorkspace(sessionId, workspace.repositoryPath, workspace.branch, "discarded");
+        return { ok: true } as const;
+      }
       const review = await gitService.review(workspace);
       const detail = review.files.length > 0
         ? `将移除独立 worktree、分支 ${workspace.branch} 以及其中 ${review.files.length} 个变更文件。已提交对象通常仍可通过 Git reflog 恢复。`
@@ -480,6 +610,7 @@ function installIpc(): void {
       if (result.response !== 1) return { ok: false, error: "已取消丢弃操作。" } as const;
       await gitService.discard(workspace);
       projectStore.updateTaskWorkspaceState(sessionId, "discarded");
+      protocol.registerTaskWorkspace(sessionId, workspace.repositoryPath, workspace.branch, "discarded");
       return { ok: true } as const;
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) } as const;
@@ -489,16 +620,18 @@ function installIpc(): void {
     try {
       if (typeof sessionId !== "string" || !["finder", "terminal", "editor"].includes(String(target))) throw new Error("打开参数无效。");
       const workspace = projectStore.getTaskWorkspace(sessionId);
-      if (!workspace || workspace.state === "discarded") throw new Error("任务 worktree 不可用。");
-      if (target === "finder") await shell.openPath(workspace.worktreePath);
+      if (!workspace || workspace.state === "discarded" || workspace.state === "missing") throw new Error("任务 worktree 不可用。");
+      if (target === "finder") {
+        const failure = await shell.openPath(workspace.worktreePath);
+        if (failure) throw new Error(failure);
+      }
       else {
         const args = target === "terminal"
           ? ["-a", "Terminal", workspace.worktreePath]
           : settingsSnapshot().editor === "vscode"
             ? ["-a", "Visual Studio Code", workspace.worktreePath]
             : [workspace.worktreePath];
-        const child = spawn("/usr/bin/open", args, { detached: true, stdio: "ignore" });
-        child.unref();
+        await execFileAsync("/usr/bin/open", args);
       }
       return { ok: true } as const;
     } catch (error) {
@@ -552,7 +685,7 @@ function installIpc(): void {
         runtime: { ...publicSnapshot(), url: undefined, logs: publicSnapshot().logs.slice(-100) },
         protocol: { phase: protocol.snapshot.phase, generation: protocol.snapshot.generation, taskCount: protocol.snapshot.tasks.length, pendingApprovals: protocol.snapshot.approvals.length, pendingQuestions: protocol.snapshot.questions.length, error: protocol.snapshot.error },
         projects: projectStore.list().map((project) => ({ id: project.id, name: project.name, active: project.active })),
-        settings: { ...settingsSnapshot(), credentialConfigured: settingsSnapshot().credentialConfigured },
+        settings: safeSettingsDiagnostics(settingsSnapshot()),
       };
       await writeFile(result.filePath, `${JSON.stringify(diagnostics, null, 2)}\n`, { mode: 0o600 });
       return { ok: true, path: result.filePath } as const;
@@ -569,6 +702,8 @@ function installMenu(): void {
         label: "DSH Desktop",
         submenu: [
           { role: "about" },
+          { type: "separator" },
+          { label: "设置…", accelerator: "CmdOrCtrl+,", click: () => mainWindow?.webContents.send("settings:open-requested") },
           { type: "separator" },
           { role: "hide" },
           { role: "hideOthers" },
@@ -602,18 +737,49 @@ function installMenu(): void {
   );
 }
 
+function deliverNotifications(): void {
+  if (!Notification.isSupported() || mainWindow?.isFocused()) return;
+  for (const [id, item] of currentNotifications) {
+    if (notifiedRequests.has(id)) continue;
+    notifiedRequests.add(id);
+    const notification = new Notification({ title: item.title, body: item.body, silent: false });
+    notification.on("click", () => {
+      mainWindow?.show();
+      mainWindow?.focus();
+      mainWindow?.webContents.send("inbox:focus");
+    });
+    notification.show();
+  }
+}
+
+function syncNotifications(snapshot: ProtocolSnapshot): void {
+  const actionable = [
+    ...snapshot.approvals.map((approval) => ({ id: `approval:${approval.approvalId}`, title: "任务需要授权", body: approval.reason ?? `${approval.toolName} 请求执行受保护操作` })),
+    ...snapshot.questions.map((question) => ({ id: `question:${question.requestId}`, title: "任务等待你的回答", body: question.questions[0]?.question ?? "Harness 需要更多信息" })),
+    ...snapshot.tasks.filter((task) => task.readyForReview && ["active", "committed"].includes(task.workspaceState ?? "active") && task.worktreeBranch && !task.archived && !task.error).map((task) => ({ id: `review:${task.sessionId}`, title: "任务可以审阅", body: task.title })),
+  ];
+  const activeIds = new Set(actionable.map((item) => item.id));
+  for (const id of notifiedRequests) if (!activeIds.has(id)) notifiedRequests.delete(id);
+  currentNotifications.clear();
+  for (const item of actionable) currentNotifications.set(item.id, item);
+  deliverNotifications();
+}
+
 app.whenReady().then(async () => {
   console.log("Electron app is ready.");
   projectStore = new ProjectStore(join(app.getPath("userData"), "desktop.sqlite"));
   gitService = new GitService(join(app.getPath("userData"), "worktrees"));
   for (const workspace of projectStore.listTaskWorkspaces()) {
-    if (workspace.state === "discarded") continue;
-    try {
-      await access(workspace.worktreePath);
-      protocol.registerTaskWorkspace(workspace.sessionId, workspace.repositoryPath, workspace.branch);
-    } catch {
-      projectStore.updateTaskWorkspaceState(workspace.sessionId, "missing");
+    let state = workspace.state;
+    if (state !== "discarded") {
+      try {
+        await access(workspace.worktreePath);
+      } catch {
+        state = "missing";
+        projectStore.updateTaskWorkspaceState(workspace.sessionId, state);
+      }
     }
+    protocol.registerTaskWorkspace(workspace.sessionId, workspace.repositoryPath, workspace.branch, state);
   }
   const activeProject = projectStore.list().find((project) => project.active);
   sidecar = new HarnessSidecar({
@@ -641,23 +807,7 @@ app.whenReady().then(async () => {
       appliedModelGeneration = snapshot.generation;
       void protocol.updateDefaultModel(settingsSnapshot().model).catch((error: unknown) => console.error("Default model setting failed.", error));
     }
-    const actionable = [
-      ...snapshot.approvals.map((approval) => ({ id: `approval:${approval.approvalId}`, title: "任务需要授权", body: approval.reason ?? `${approval.toolName} 请求执行受保护操作` })),
-      ...snapshot.questions.map((question) => ({ id: `question:${question.requestId}`, title: "任务等待你的回答", body: question.questions[0]?.question ?? "Harness 需要更多信息" })),
-      ...snapshot.tasks.filter((task) => task.readyForReview && task.worktreeBranch && !task.archived && !task.error).map((task) => ({ id: `review:${task.sessionId}`, title: "任务可以审阅", body: task.title })),
-    ];
-    for (const item of actionable) {
-      if (notifiedRequests.has(item.id)) continue;
-      notifiedRequests.add(item.id);
-      if (!Notification.isSupported() || mainWindow?.isFocused()) continue;
-      const notification = new Notification({ title: item.title, body: item.body, silent: false });
-      notification.on("click", () => {
-        mainWindow?.show();
-        mainWindow?.focus();
-        mainWindow?.webContents.send("inbox:focus");
-      });
-      notification.show();
-    }
+    syncNotifications(snapshot);
   });
   protocol.on("timeline", (snapshot) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("tasks:timeline-changed", snapshot);
@@ -665,6 +815,7 @@ app.whenReady().then(async () => {
   installIpc();
   installMenu();
   await createMainWindow();
+  mainWindow?.on("blur", deliverNotifications);
   void sidecar.start().catch((error: unknown) => {
     console.error("Harness failed before process start.", error);
   });

@@ -15,7 +15,7 @@ export class HarnessProtocolClient extends EventEmitter {
   #questions = new Map<string, PendingQuestion & { rpcId: string }>();
   #toolCalls = new Map<string, { name: string; detail?: string }>();
   #archived = new Set<string>();
-  #workspaceMeta = new Map<string, { projectPath: string; branch: string }>();
+  #workspaceMeta = new Map<string, { projectPath: string; branch: string; state: DesktopTaskSummary["workspaceState"] }>();
   #timelines = new Map<string, TaskTimelineSnapshot>();
   #upstream: URL | undefined;
   #epoch = 0;
@@ -77,15 +77,22 @@ export class HarnessProtocolClient extends EventEmitter {
     this.#tasks = new Map(tasks.map((task) => {
       const approvals = [...this.#approvals.values()].filter((approval) => approval.sessionId === task.sessionId).length;
       const meta = this.#workspaceMeta.get(task.sessionId);
-      return [task.sessionId, { ...task, pendingApprovals: approvals, archived: this.#archived.has(task.sessionId), ...(meta ? { projectPath: meta.projectPath, worktreeBranch: meta.branch } : {}) }];
+      return [task.sessionId, { ...task, pendingApprovals: approvals, archived: this.#archived.has(task.sessionId), ...(meta ? { projectPath: meta.projectPath, worktreeBranch: meta.branch, workspaceState: meta.state } : {}) }];
     }));
     this.#publish();
     return this.snapshot;
   }
 
-  registerTaskWorkspace(sessionId: string, projectPath: string, branch: string): void {
-    this.#workspaceMeta.set(sessionId, { projectPath, branch });
-    this.#updateTask(sessionId, { projectPath, worktreeBranch: branch });
+  registerTaskWorkspace(sessionId: string, projectPath: string, branch: string, state: DesktopTaskSummary["workspaceState"] = "active"): void {
+    this.#workspaceMeta.set(sessionId, { projectPath, branch, state });
+    this.#updateTask(sessionId, { projectPath, worktreeBranch: branch, workspaceState: state });
+  }
+
+  unregisterTaskWorkspace(sessionId: string): void {
+    this.#workspaceMeta.delete(sessionId);
+    this.#tasks.delete(sessionId);
+    this.#timelines.delete(sessionId);
+    this.#publish();
   }
 
   async createTask(cwd: string, prompt: string, preallocatedSessionId?: string): Promise<string> {
@@ -95,14 +102,21 @@ export class HarnessProtocolClient extends EventEmitter {
     if (content.length > MAX_PROMPT_CHARS) throw new Error(`任务内容不能超过 ${MAX_PROMPT_CHARS} 个字符。`);
     const sessionId = preallocatedSessionId ?? randomUUID();
     this.#assertSessionId(sessionId);
-    await this.#rpc("session.create", { sessionId, cwd });
-    await this.#rpc("session.selectModel", { sessionId, provider: "deepseek-official", model: this.#defaultModel });
-    await this.#rpc("session.prompt", {
-      sessionId,
-      mode: "queue",
-      content: [{ type: "text", text: content }],
-      clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    });
+    let created = false;
+    try {
+      await this.#rpc("session.create", { sessionId, cwd });
+      created = true;
+      await this.#rpc("session.selectModel", { sessionId, provider: "deepseek-official", model: this.#defaultModel });
+      await this.#rpc("session.prompt", {
+        sessionId,
+        mode: "queue",
+        content: [{ type: "text", text: content }],
+        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
+    } catch (error) {
+      if (created) await this.#rpc("workspace.archiveSession", { sessionId }).catch(() => undefined);
+      throw error;
+    }
     const workspaceMeta = this.#workspaceMeta.get(sessionId);
     this.#tasks.set(sessionId, {
       sessionId,
@@ -114,7 +128,7 @@ export class HarnessProtocolClient extends EventEmitter {
       pendingApprovals: 0,
       archived: false,
       readyForReview: false,
-      ...(workspaceMeta ? { projectPath: workspaceMeta.projectPath, worktreeBranch: workspaceMeta.branch } : {}),
+      ...(workspaceMeta ? { projectPath: workspaceMeta.projectPath, worktreeBranch: workspaceMeta.branch, workspaceState: workspaceMeta.state } : {}),
     });
     this.#publish();
     return sessionId;
@@ -378,7 +392,7 @@ export class HarnessProtocolClient extends EventEmitter {
         pendingApprovals: 0,
         archived: false,
         readyForReview: false,
-        ...(workspaceMeta ? { projectPath: workspaceMeta.projectPath, worktreeBranch: workspaceMeta.branch } : {}),
+        ...(workspaceMeta ? { projectPath: workspaceMeta.projectPath, worktreeBranch: workspaceMeta.branch, workspaceState: workspaceMeta.state } : {}),
       });
       this.#publish();
       return;

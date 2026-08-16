@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { DesktopTaskSummary, GitReviewSnapshot, PendingApproval, PendingQuestion, ProjectRecord, ProtocolSnapshot, SettingsSnapshot, SidecarPhase, SidecarSnapshot, TaskTimelineSnapshot, TimelineItem } from "../shared/contracts";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { DesktopTaskSummary, FilePreview, GitReviewSnapshot, PendingApproval, PendingQuestion, ProjectRecord, ProtocolSnapshot, SettingsSnapshot, SidecarPhase, SidecarSnapshot, TaskTimelineSnapshot, TimelineItem } from "../shared/contracts";
 
 const INITIAL: SidecarSnapshot = {
   phase: "idle",
@@ -166,6 +166,8 @@ const PROTOCOL_LABEL: Record<ProtocolSnapshot["phase"], string> = {
 };
 
 function taskStatus(task: DesktopTaskSummary): string {
+  if (task.workspaceState === "discarded") return "工作区已丢弃";
+  if (task.workspaceState === "missing") return "工作区缺失";
   return task.pendingApprovals > 0 ? `等待 ${task.pendingApprovals} 项授权` : task.running ? "运行中" : task.readyForReview ? "待审阅" : task.blank ? "尚未开始" : "已停止";
 }
 
@@ -286,7 +288,9 @@ function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protoco
   const [apiKey, setApiKey] = useState("");
   const [baseURL, setBaseURL] = useState("https://api.deepseek.com");
   const [model, setModel] = useState("deepseek-v4-flash");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [editor, setEditor] = useState<"vscode" | "system">("vscode");
+  const [browserURL, setBrowserURL] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "success" | "error"; text: string }>();
 
@@ -299,7 +303,10 @@ function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protoco
   async function testConnection() {
     setBusy(true); setMessage(undefined);
     const result = await window.dshDesktop.testModelConnection({ ...(apiKey.trim() ? { apiKey } : {}), baseURL });
-    setMessage(result.ok ? { kind: "success", text: `连接成功，服务返回 ${result.models.length} 个可用模型。` } : { kind: "error", text: result.error });
+    if (result.ok) {
+      setAvailableModels(result.models);
+      setMessage({ kind: "success", text: `连接成功，服务返回 ${result.models.length} 个可用模型。连接测试不执行对话请求。` });
+    } else setMessage({ kind: "error", text: result.error });
     setBusy(false);
   }
 
@@ -327,17 +334,25 @@ function SettingsView({ runtime, protocol }: { runtime: SidecarSnapshot; protoco
     setBusy(false);
   }
 
+  async function openBrowser() {
+    setBusy(true); setMessage(undefined);
+    const result = await window.dshDesktop.openWebAddress(browserURL);
+    if (!result.ok) setMessage({ kind: "error", text: result.error });
+    setBusy(false);
+  }
+
   return (
     <main className="workspace settings-workspace">
       <header className="workspace-header"><div><p className="context-line">本机配置</p><h1>设置</h1></div><span className={`settings-health settings-health--${settings?.credentialConfigured ? "ready" : "missing"}`}>{settings?.credentialConfigured ? "凭证已配置" : "需要 API Key"}</span></header>
       {message && <section className={`settings-message settings-message--${message.kind}`} role="status">{message.text}</section>}
       <section className="settings-section" aria-labelledby="models-settings"><header><h2 id="models-settings">模型与凭证</h2><p>密钥由 macOS 钥匙串支持的安全存储保护，界面不会读回或显示已有值。</p></header><div className="settings-form">
         <label><span>DeepSeek API Key</span><div className="secret-input"><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" placeholder={settings?.credentialConfigured ? "已配置；留空则保持不变" : "输入 API Key"} />{settings?.credentialConfigured && <button type="button" onClick={() => void clearKey()} disabled={busy}>移除</button>}</div></label>
-        <label><span>API 端点</span><input value={baseURL} onChange={(event) => setBaseURL(event.target.value)} spellCheck={false} /></label>
-        <label><span>默认模型</span><select value={model} onChange={(event) => setModel(event.target.value)}><option value="deepseek-v4-flash">DeepSeek-V4-Flash</option><option value="deepseek-v4-pro">DeepSeek-V4-Pro</option></select></label>
+        <label><span>API 端点</span><input value={baseURL} onChange={(event) => setBaseURL(event.target.value)} spellCheck={false} /><small>支持 DeepSeek API 或兼容 DeepSeek chat-completions 请求格式的网关。</small></label>
+        <label><span>默认模型</span><input list="available-models" value={model} onChange={(event) => setModel(event.target.value)} spellCheck={false} /><datalist id="available-models"><option value="deepseek-v4-flash" /><option value="deepseek-v4-pro" />{availableModels.map((id) => <option value={id} key={id} />)}</datalist><small>可输入端点接受的模型 ID；连接测试返回的模型会作为建议显示。</small></label>
         <div className="settings-form-actions"><button className="button button--secondary" type="button" onClick={() => void testConnection()} disabled={busy || (!apiKey.trim() && !settings?.credentialConfigured)}>测试连接</button><button className="button button--primary" type="button" onClick={() => void save()} disabled={busy || !baseURL.trim() || !model.trim()}>{busy ? "正在处理…" : "保存并重启 Harness"}</button></div>
       </div></section>
       <section className="settings-section" aria-labelledby="workspace-settings"><header><h2 id="workspace-settings">工作区与外部工具</h2><p>新任务默认使用从当前 HEAD 创建的独立 Git worktree。</p></header><div className="settings-form"><label><span>外部编辑器</span><select value={editor} onChange={(event) => setEditor(event.target.value as "vscode" | "system")}><option value="vscode">Visual Studio Code</option><option value="system">系统默认应用</option></select></label><div className="settings-readonly"><span>任务隔离</span><strong>独立 worktree（默认）</strong></div></div></section>
+      <section className="settings-section" aria-labelledby="browser-settings"><header><h2 id="browser-settings">内置浏览器</h2><p>在独立沙箱窗口打开 HTTP/HTTPS 地址；权限请求、下载和非网页协议默认拒绝。</p></header><div className="settings-form"><label><span>网络地址</span><input type="url" value={browserURL} onChange={(event) => setBrowserURL(event.target.value)} placeholder="https://example.com" spellCheck={false} /><small>Markdown 中的网络链接也会使用这个受限窗口打开。任务 worktree 内的 Markdown 文件则直接在变更审阅中预览。</small></label><div className="settings-form-actions"><button className="button button--secondary" type="button" onClick={() => void openBrowser()} disabled={busy || !browserURL.trim()}>在内置浏览器打开</button></div></div></section>
       <section className="settings-section" aria-labelledby="diagnostic-settings"><header><h2 id="diagnostic-settings">运行时与诊断</h2><p>导出的 JSON 会移除密钥、传输凭证、端点和项目绝对路径。</p></header><div className="diagnostic-grid"><div><span>Harness</span><strong>{PHASE_LABEL[runtime.phase]}</strong></div><div><span>协议</span><strong>{PROTOCOL_LABEL[protocol.phase]} · 代次 {protocol.generation}</strong></div><div><span>版本</span><strong>{runtime.harnessVersion}</strong></div></div><button className="button button--secondary" type="button" onClick={() => void exportDiagnostics()} disabled={busy}>导出诊断信息…</button></section>
       <footer className="workspace-footer"><span>遥测默认关闭</span><span>社区项目 · 非 DeepSeek 官方应用</span></footer>
     </main>
@@ -379,10 +394,107 @@ function TimelineRow({ item }: { item: TimelineItem }) {
 
 const FILE_STATUS_LABEL: Record<string, string> = { added: "新增", modified: "修改", deleted: "删除", renamed: "重命名", untracked: "未跟踪", conflicted: "冲突" };
 
+function markdownTarget(currentPath: string, href: string): string | undefined {
+  const clean = href.split(/[?#]/, 1)[0] ?? "";
+  if (!clean || clean.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(clean)) return undefined;
+  let decoded: string;
+  try { decoded = decodeURIComponent(clean); } catch { return undefined; }
+  const parts = [...currentPath.split("/").slice(0, -1), ...decoded.split("/")];
+  const normalized: string[] = [];
+  for (const part of parts) {
+    if (!part || part === ".") continue;
+    if (part === "..") { if (normalized.length === 0) return undefined; normalized.pop(); }
+    else normalized.push(part);
+  }
+  const path = normalized.join("/");
+  return /\.md(?:own)?$/i.test(path) ? path : undefined;
+}
+
+function MarkdownInline({ text, currentPath, onOpenFile, onError }: { text: string; currentPath: string; onOpenFile(path: string): void; onError(message: string): void }) {
+  const nodes: ReactNode[] = [];
+  const pattern = /(`[^`]+`|\[[^\]]+\]\([^)]+\)|https?:\/\/[^\s<]+)/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) nodes.push(text.slice(cursor, index));
+    const token = match[0];
+    if (token.startsWith("`")) nodes.push(<code key={index}>{token.slice(1, -1)}</code>);
+    else {
+      const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(token);
+      const label = link?.[1] ?? token;
+      const href = link?.[2] ?? token;
+      nodes.push(<button className="markdown-link" type="button" key={index} onClick={() => {
+        if (/^https?:\/\//i.test(href)) {
+          void window.dshDesktop.openWebAddress(href).then((result) => { if (!result.ok) onError(result.error); });
+          return;
+        }
+        const path = markdownTarget(currentPath, href);
+        if (path) onOpenFile(path);
+        else onError("该链接不是可预览的 Markdown 文件或 HTTP/HTTPS 地址。");
+      }}>{label}</button>);
+    }
+    cursor = index + token.length;
+  }
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return <>{nodes}</>;
+}
+
+export function MarkdownPreview({ preview, onOpenFile, onError }: { preview: FilePreview; onOpenFile(path: string): void; onError(message: string): void }) {
+  const lines = preview.content.replaceAll("\r\n", "\n").split("\n");
+  const blocks: ReactNode[] = [];
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index] ?? "";
+    if (!line.trim()) { index += 1; continue; }
+    if (/^```/.test(line)) {
+      const language = line.slice(3).trim();
+      const code: string[] = [];
+      index += 1;
+      while (index < lines.length && !/^```/.test(lines[index] ?? "")) code.push(lines[index++] ?? "");
+      if (index < lines.length) index += 1;
+      blocks.push(<pre className="markdown-code" key={`code-${index}`}><code data-language={language || undefined}>{code.join("\n")}</code></pre>);
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (heading) {
+      const level = Math.min(6, heading[1]?.length ?? 1);
+      const content = <MarkdownInline text={heading[2] ?? ""} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} />;
+      blocks.push(level === 1 ? <h1 key={index}>{content}</h1> : level === 2 ? <h2 key={index}>{content}</h2> : level === 3 ? <h3 key={index}>{content}</h3> : <h4 key={index}>{content}</h4>);
+      index += 1;
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\s*[-*+]\s+/.test(lines[index] ?? "")) items.push((lines[index++] ?? "").replace(/^\s*[-*+]\s+/, ""));
+      blocks.push(<ul key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></li>)}</ul>);
+      continue;
+    }
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\s*\d+[.)]\s+/.test(lines[index] ?? "")) items.push((lines[index++] ?? "").replace(/^\s*\d+[.)]\s+/, ""));
+      blocks.push(<ol key={`list-${index}`}>{items.map((item, itemIndex) => <li key={itemIndex}><MarkdownInline text={item} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></li>)}</ol>);
+      continue;
+    }
+    if (/^>\s?/.test(line)) {
+      const quote: string[] = [];
+      while (index < lines.length && /^>\s?/.test(lines[index] ?? "")) quote.push((lines[index++] ?? "").replace(/^>\s?/, ""));
+      blocks.push(<blockquote key={`quote-${index}`}><MarkdownInline text={quote.join(" ")} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></blockquote>);
+      continue;
+    }
+    if (/^\s*(?:---+|\*\*\*+)\s*$/.test(line)) { blocks.push(<hr key={index} />); index += 1; continue; }
+    const paragraph = [line.trim()];
+    index += 1;
+    while (index < lines.length && (lines[index] ?? "").trim() && !/^(?:#{1,6}\s|```|\s*[-*+]\s+|\s*\d+[.)]\s+|>\s?)/.test(lines[index] ?? "")) paragraph.push((lines[index++] ?? "").trim());
+    blocks.push(<p key={`p-${index}`}><MarkdownInline text={paragraph.join(" ")} currentPath={preview.path} onOpenFile={onOpenFile} onError={onError} /></p>);
+  }
+  return <article className="markdown-preview">{blocks}</article>;
+}
+
 function ReviewPanel({ sessionId, onDiscarded }: { sessionId: string; onDiscarded(): void }) {
   const [review, setReview] = useState<GitReviewSnapshot>();
   const [selectedPath, setSelectedPath] = useState<string>();
   const [diff, setDiff] = useState("");
+  const [preview, setPreview] = useState<FilePreview>();
+  const [viewerMode, setViewerMode] = useState<"diff" | "preview">("diff");
   const [commitMessage, setCommitMessage] = useState("完成任务");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -395,9 +507,36 @@ function ReviewPanel({ sessionId, onDiscarded }: { sessionId: string; onDiscarde
 
   async function selectFile(path: string) {
     setSelectedPath(path);
+    setError(undefined);
+    if (/\.md(?:own)?$/i.test(path)) {
+      setViewerMode("preview");
+      setPreview(undefined);
+      const result = await window.dshDesktop.getTaskFilePreview(sessionId, path);
+      if (result.ok) setPreview(result.preview); else setError(result.error);
+      return;
+    }
+    setViewerMode("diff");
+    setPreview(undefined);
     setDiff("正在载入差异…");
     const result = await window.dshDesktop.getTaskFileDiff(sessionId, path);
     setDiff(result.ok ? result.diff : result.error);
+  }
+
+  async function showDiff() {
+    if (!selectedPath) return;
+    setViewerMode("diff");
+    setDiff("正在载入差异…");
+    const result = await window.dshDesktop.getTaskFileDiff(sessionId, selectedPath);
+    setDiff(result.ok ? result.diff : result.error);
+  }
+
+  async function showPreview(path = selectedPath) {
+    if (!path) return;
+    setSelectedPath(path);
+    setViewerMode("preview");
+    setPreview(undefined);
+    const result = await window.dshDesktop.getTaskFilePreview(sessionId, path);
+    if (result.ok) setPreview(result.preview); else setError(result.error);
   }
 
   async function commit() {
@@ -446,7 +585,7 @@ function ReviewPanel({ sessionId, onDiscarded }: { sessionId: string; onDiscarde
             ))}
           </aside>
           <div className="diff-viewer">
-            {selectedPath ? <><header>{selectedPath}</header><pre>{diff}</pre></> : <div><h2>选择文件查看差异</h2><p>显示相对于任务基线提交的统一 diff。</p></div>}
+            {selectedPath ? <><header><span>{selectedPath}</span>{/\.md(?:own)?$/i.test(selectedPath) && <nav aria-label="Markdown 查看方式"><button className={viewerMode === "preview" ? "active" : ""} type="button" onClick={() => void showPreview()}>预览</button><button className={viewerMode === "diff" ? "active" : ""} type="button" onClick={() => void showDiff()}>差异</button></nav>}</header>{viewerMode === "preview" ? preview ? <MarkdownPreview preview={preview} onOpenFile={(path) => void showPreview(path)} onError={setError} /> : <div><p>正在载入 Markdown…</p></div> : <pre>{diff}</pre>}</> : <div><h2>选择文件查看差异</h2><p>Markdown 文件会优先在应用内预览。</p></div>}
           </div>
         </div>
       )}
@@ -745,10 +884,12 @@ export function App() {
       setFocusComposer((value) => value + 1);
     });
     const unsubscribeInbox = window.dshDesktop.subscribeInboxFocus(() => setView("inbox"));
+    const unsubscribeSettings = window.dshDesktop.subscribeSettingsOpen(() => setView("settings"));
     return () => {
       unsubscribeProtocol();
       unsubscribeNewTask();
       unsubscribeInbox();
+      unsubscribeSettings();
     };
   }, []);
 

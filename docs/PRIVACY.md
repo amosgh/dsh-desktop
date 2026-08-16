@@ -13,6 +13,8 @@ DSH Desktop is local-first and has no product account service or analytics pipel
 
 Prompts and any repository context selected by Harness are sent to the configured model endpoint. The endpoint operator's terms and privacy policy govern that traffic. Opening links or configured external editors invokes those local/system applications. DSH Desktop does not send product analytics or crash reports.
 
+HTTP/HTTPS links opened in the in-app browser are requested directly from that site in an isolated, in-memory browser session. The browser denies permission requests and downloads, but the destination still receives ordinary network metadata such as the IP address and request headers. Markdown preview itself is local and does not automatically load remote images or other embedded resources.
+
 ## Diagnostics
 
 Diagnostic export is user-initiated. It contains app/runtime state, recent redacted logs, counts, non-path project names/IDs, and non-secret settings. It excludes the API key, gateway capability, raw endpoint URL, task content, diffs, and absolute repository paths.

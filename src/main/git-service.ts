@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
-import { access, mkdir, realpath, rm, statfs } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { access, mkdir, readFile, realpath, rm, statfs } from "node:fs/promises";
+import { extname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { GitChangedFile, GitReviewSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
+import type { FilePreview, GitChangedFile, GitReviewSnapshot, TaskWorkspaceRecord } from "../shared/contracts.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT = 8 * 1024 * 1024;
 const MAX_DIFF_OUTPUT = 2 * 1024 * 1024;
+const MAX_PREVIEW_OUTPUT = 1024 * 1024;
 
 export class GitService {
   #worktreeRoot: string;
@@ -57,27 +58,53 @@ export class GitService {
   }
 
   async review(workspace: TaskWorkspaceRecord): Promise<GitReviewSnapshot> {
-    try {
-      await access(workspace.worktreePath);
-      const [nameStatus, untracked, conflicts, numstat] = await Promise.all([
-        this.#git(workspace.worktreePath, ["diff", "--name-status", "-z", workspace.baseSha, "--"]),
-        this.#git(workspace.worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]),
-        this.#git(workspace.worktreePath, ["diff", "--name-only", "--diff-filter=U", "-z"]),
-        this.#git(workspace.worktreePath, ["diff", "--numstat", "-z", workspace.baseSha, "--"]),
-      ]);
-      const files = this.#parseChangedFiles(nameStatus, untracked, conflicts);
-      const totals = this.#parseNumstat(numstat);
-      return { sessionId: workspace.sessionId, workspace, phase: "ready", files, additions: totals.additions, deletions: totals.deletions, clean: files.length === 0 };
-    } catch (error) {
-      return { sessionId: workspace.sessionId, workspace, phase: "error", files: [], additions: 0, deletions: 0, clean: false, error: error instanceof Error ? error.message : String(error) };
-    }
+    return this.#withRepositoryLock(workspace.repositoryPath, async () => {
+      try {
+        await access(workspace.worktreePath);
+        const [nameStatus, untracked, conflicts, numstat] = await Promise.all([
+          this.#git(workspace.worktreePath, ["diff", "--name-status", "-z", workspace.baseSha, "--"]),
+          this.#git(workspace.worktreePath, ["ls-files", "--others", "--exclude-standard", "-z"]),
+          this.#git(workspace.worktreePath, ["diff", "--name-only", "--diff-filter=U", "-z"]),
+          this.#git(workspace.worktreePath, ["diff", "--numstat", "-z", workspace.baseSha, "--"]),
+        ]);
+        const files = this.#parseChangedFiles(nameStatus, untracked, conflicts);
+        const totals = this.#parseNumstat(numstat);
+        return { sessionId: workspace.sessionId, workspace, phase: "ready", files, additions: totals.additions, deletions: totals.deletions, clean: files.length === 0 };
+      } catch (error) {
+        return { sessionId: workspace.sessionId, workspace, phase: "error", files: [], additions: 0, deletions: 0, clean: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    });
   }
 
   async diff(workspace: TaskWorkspaceRecord, path: string): Promise<string> {
-    const safePath = this.#validateRelativePath(path);
-    const output = await this.#git(workspace.worktreePath, ["diff", "--no-ext-diff", "--no-color", "--unified=3", workspace.baseSha, "--", safePath], MAX_DIFF_OUTPUT);
-    if (Buffer.byteLength(output) >= MAX_DIFF_OUTPUT - 1024) return `${output}\n\n[Diff output truncated by DSH Desktop]`;
-    return output || "该文件没有可显示的文本差异；它可能是未跟踪文件、二进制文件，或只有模式变化。";
+    return this.#withRepositoryLock(workspace.repositoryPath, async () => {
+      const safePath = this.#validateRelativePath(path);
+      const output = await this.#git(workspace.worktreePath, ["diff", "--no-ext-diff", "--no-color", "--unified=3", workspace.baseSha, "--", safePath], MAX_DIFF_OUTPUT);
+      if (Buffer.byteLength(output) >= MAX_DIFF_OUTPUT - 1024) return `${output}\n\n[Diff output truncated by DSH Desktop]`;
+      return output || "该文件没有可显示的文本差异；它可能是未跟踪文件、二进制文件，或只有模式变化。";
+    });
+  }
+
+  async preview(workspace: TaskWorkspaceRecord, path: string): Promise<FilePreview> {
+    return this.#withRepositoryLock(workspace.repositoryPath, async () => {
+      const safePath = this.#validateRelativePath(path);
+      if (![".md", ".markdown"].includes(extname(safePath).toLowerCase())) throw new Error("当前仅支持在应用内预览 Markdown 文件。");
+      let content: string;
+      try {
+        const root = await realpath(workspace.worktreePath);
+        const target = await realpath(join(root, safePath));
+        const rel = relative(root, target);
+        if (!rel || rel.startsWith("..") || resolve(root, rel) !== target) throw new Error("Markdown 文件超出任务 worktree 范围。");
+        const bytes = await readFile(target);
+        if (bytes.byteLength > MAX_PREVIEW_OUTPUT) throw new Error("Markdown 文件超过 1 MB，无法在应用内预览。");
+        content = bytes.toString("utf8");
+      } catch (error) {
+        if (error instanceof Error && (/超过|超出/.test(error.message))) throw error;
+        content = await this.#git(workspace.worktreePath, ["show", `${workspace.baseSha}:${safePath}`], MAX_PREVIEW_OUTPUT);
+      }
+      if (Buffer.byteLength(content) >= MAX_PREVIEW_OUTPUT - 1024) throw new Error("Markdown 文件超过 1 MB，无法在应用内预览。");
+      return { path: safePath, kind: "markdown", content };
+    });
   }
 
   async commit(workspace: TaskWorkspaceRecord, message: string): Promise<string> {

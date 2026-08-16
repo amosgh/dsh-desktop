@@ -33,6 +33,7 @@ export class HarnessSidecar extends EventEmitter {
   #restartAttempts = 0;
   #restartTimer: NodeJS.Timeout | undefined;
   #stableTimer: NodeJS.Timeout | undefined;
+  #startupTimer: NodeJS.Timeout | undefined;
 
   constructor(private readonly options: HarnessSidecarOptions) {
     super();
@@ -113,13 +114,14 @@ export class HarnessSidecar extends EventEmitter {
       this.#fail(`Harness exited unexpectedly (${signal ?? `code ${code ?? "unknown"}`}).`);
     });
 
-    const timeout = setTimeout(() => {
+    this.#startupTimer = setTimeout(() => {
+      this.#startupTimer = undefined;
       if (this.#snapshot.phase === "starting") {
         this.#fail("Harness did not publish a loopback endpoint within 25 seconds.");
         child.kill("SIGTERM");
       }
     }, STARTUP_TIMEOUT_MS);
-    timeout.unref();
+    this.#startupTimer.unref();
 
     return this.snapshot;
   }
@@ -130,13 +132,14 @@ export class HarnessSidecar extends EventEmitter {
     this.#restartTimer = undefined;
     if (this.#stableTimer) clearTimeout(this.#stableTimer);
     this.#stableTimer = undefined;
+    if (this.#startupTimer) clearTimeout(this.#startupTimer);
+    this.#startupTimer = undefined;
     this.#stopRequested = true;
     if (!child) {
       this.#setSnapshot({ ...this.#snapshot, phase: "stopped", pid: undefined, url: undefined });
       return this.snapshot;
     }
 
-    this.#stopRequested = true;
     this.#setSnapshot({ ...this.#snapshot, phase: "stopping" });
     child.kill("SIGTERM");
 
@@ -170,6 +173,8 @@ export class HarnessSidecar extends EventEmitter {
     this.#appendLogs(chunk);
     const url = parseHarnessUrl(this.#pendingOutput);
     if (url && this.#snapshot.phase === "starting") {
+      if (this.#startupTimer) clearTimeout(this.#startupTimer);
+      this.#startupTimer = undefined;
       this.#setSnapshot({ ...this.#snapshot, phase: "ready", url });
       this.#stableTimer = setTimeout(() => {
         this.#restartAttempts = 0;
@@ -194,6 +199,8 @@ export class HarnessSidecar extends EventEmitter {
   }
 
   #fail(message: string): void {
+    if (this.#startupTimer) clearTimeout(this.#startupTimer);
+    this.#startupTimer = undefined;
     this.#setSnapshot({
       ...this.#snapshot,
       phase: "error",

@@ -21,6 +21,7 @@ The local MVP implements the complete supervised task loop:
 - Paginated history, plan projection, live timeline, reconnect recovery, and a 10,000-event replay fixture.
 - Inbox approvals and questions with exact operation details, single-resolution semantics, and native notifications.
 - Per-task Git worktrees pinned to a base commit, repository mutation serialization, review/diff, commit, external tools, and confirmed discard.
+- In-app Markdown preview for task worktrees and a sandboxed internal browser for HTTP/HTTPS links.
 - Keychain-backed API-key encryption, endpoint/model settings, connection checks, and redacted diagnostics export.
 - Light/dark appearance and reduced-motion support.
 
@@ -34,7 +35,7 @@ The current source release intentionally targets one reproducible environment:
 - macOS 14 or later.
 - Native arm64 Node.js 24 or later and its bundled npm.
 - Git and the Xcode Command Line Tools.
-- A DeepSeek API key, or credentials for a compatible endpoint that implements the OpenAI-style `/models` and chat-completions APIs.
+- A DeepSeek API key, or credentials for a gateway that implements `/models` and is compatible with DeepSeek's chat-completions request, streaming, reasoning, and tool-call behavior.
 
 Check the environment before installing dependencies:
 
@@ -74,7 +75,9 @@ Keep the terminal open while using the development app. On first launch:
 3. Select a model, run **Test connection**, then choose **Save and restart Harness**.
 4. Add a repository with `Cmd+O`.
 
-The selected project must be a writable Git worktree with at least one commit and a valid `HEAD`. New tasks create isolated worktrees, so keep at least 256 MB of free disk space. The connection test calls `<base URL>/models` and does not create a billable chat completion.
+The selected project must be a writable Git worktree with at least one commit and a valid `HEAD`. New tasks create isolated worktrees, so keep at least 256 MB of free disk space. The connection test calls `<base URL>/models` and does not create a billable chat completion; a successful catalog response alone cannot prove full chat, streaming, reasoning, or tool-call compatibility.
+
+Markdown files selected in a task's change review open in a read-only in-app preview. Relative Markdown links stay inside the same managed worktree; HTTP/HTTPS links open in a separate sandboxed browser window. That browser denies permission requests, downloads, embedded credentials, `file:` URLs, and executable URL schemes. Other local file types continue to use Finder or the configured external editor.
 
 ## Verify the checkout
 
@@ -106,6 +109,7 @@ Application data is stored under `~/Library/Application Support/dsh-desktop`. AP
 - **A native dependency fails to build:** install or update the Xcode Command Line Tools, then rerun `npm ci`.
 - **A project cannot be added or a task cannot start:** confirm the directory is inside a writable Git repository and `git rev-parse HEAD` succeeds.
 - **Test connection returns 404:** configure the provider's base URL so `<base URL>/models` is valid; do not paste the full chat-completions path.
+- **A third-party endpoint passes connection testing but a task fails:** confirm it implements DeepSeek-compatible streaming, reasoning fields, and tool calls. Passing `/models` is only a credential/catalog check, not a complete protocol certification.
 - **The packaged app is blocked on another Mac:** the local build is not signed or notarized. Build it from source on that Mac, or distribute a properly signed and notarized release.
 
 ## Planning
